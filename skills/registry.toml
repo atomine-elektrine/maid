@@ -1,0 +1,5 @@
+[[skill]]
+name = "echo"
+version = "0.1.0"
+description = "Example local echo skill"
+source = "echo"

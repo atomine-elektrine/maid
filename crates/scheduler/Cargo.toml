@@ -1,0 +1,13 @@
+[package]
+name = "maid-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+maid-core = { path = "../core" }
+tokio.workspace = true
+tracing.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "maid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "maid"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+maid-channel-telegram = { path = "../../crates/channel-telegram" }
+maid-core = { path = "../../crates/core" }
+maid-model = { path = "../../crates/model" }
+maid-skill-sdk = { path = "../../crates/skill-sdk" }
+maid-sandbox = { path = "../../crates/sandbox" }
+maid-scheduler = { path = "../../crates/scheduler" }
+maid-storage = { path = "../../crates/storage" }
+async-trait.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

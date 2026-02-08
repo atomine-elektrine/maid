@@ -1,0 +1,46 @@
+database_path = "data/assistant.db"
+group_root = "groups"
+runtime = "apple_container"
+
+[model]
+provider = "openai"
+api_key_env = "OPENAI_API_KEY"
+api_key_envs = ["OPENAI_API_KEY"]
+base_url = "https://api.openai.com/v1"
+model = "gpt-4.1-mini"
+fallback_models = ["gpt-4o-mini"]
+
+[scheduler]
+tick_seconds = 30
+max_concurrency = 2
+
+[telegram]
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+polling_timeout_seconds = 30
+dm_policy = "pairing"
+activation_mode = "mention"
+mention_token = "@maid"
+
+[skills]
+directory = "skills"
+enabled = ["echo"]
+# tool_allowlist = ["group.list", "group.create", "run.prompt", "task.list", "task.create", "task.run_now", "task.pause", "task.resume", "task.delete", "task.clear_group", "task.clear_all", "ops.web_fetch", "ops.search", "ops.grep"]
+# tool_max_calls_per_minute = 60
+validate_on_startup = true
+# [skills.signing]
+# require_signatures = false
+# trusted_keys = { "local.dev" = "keys/local-dev.public.pem" }
+
+[tools]
+auto_router_enabled = true
+auto_router_allowlist = ["ops.web_fetch", "ops.search", "ops.grep", "task.list", "group.list"]
+web_fetch_timeout_seconds = 15
+web_fetch_max_bytes = 131072
+# web_fetch_allowed_domains = ["wttr.in", "api.duckduckgo.com"]
+# grep_max_file_bytes = 1048576
+# grep_max_matches = 100
+# search_max_results = 5
+
+[policy]
+allow_job_tasks = false
+allow_job_task_groups = []

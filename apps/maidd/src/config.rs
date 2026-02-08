@@ -1,0 +1,1227 @@
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppConfig {
+    pub database_path: String,
+    pub group_root: String,
+    pub runtime: String,
+    pub model: ModelConfig,
+    pub scheduler: SchedulerConfig,
+    pub telegram: Option<TelegramConfig>,
+    pub skills: Option<SkillsConfig>,
+    pub tools: Option<ToolsConfig>,
+    pub policy: Option<PolicyConfig>,
+    pub security: Option<SecurityConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelConfig {
+    pub provider: String,
+    pub api_key_env: String,
+    pub api_key_envs: Option<Vec<String>>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub fallback_models: Option<Vec<String>>,
+    pub active_profile: Option<String>,
+    pub profiles: Option<BTreeMap<String, ModelProfileConfig>>,
+    pub ops: Option<ModelOpsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelProfileConfig {
+    pub provider: Option<String>,
+    pub api_key_env: Option<String>,
+    pub api_key_envs: Option<Vec<String>>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub fallback_models: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelOpsConfig {
+    pub max_retries: Option<u32>,
+    pub retry_backoff_ms: Option<u64>,
+    pub requests_per_minute: Option<u32>,
+    pub requests_per_day: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SchedulerConfig {
+    pub tick_seconds: u64,
+    pub max_concurrency: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramConfig {
+    pub bot_token_env: String,
+    pub polling_timeout_seconds: Option<u64>,
+    pub allowed_chat_ids: Option<Vec<i64>>,
+    pub allow_job_tasks: Option<bool>,
+    pub dm_policy: Option<String>,
+    pub activation_mode: Option<String>,
+    pub mention_token: Option<String>,
+    pub main_chat_id: Option<i64>,
+    pub per_chat_activation_mode: Option<BTreeMap<String, String>>,
+    pub per_chat_mention_token: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillsConfig {
+    pub directory: Option<String>,
+    pub enabled: Option<Vec<String>>,
+    pub allow_unlisted: Option<bool>,
+    pub tool_allowlist: Option<Vec<String>>,
+    pub tool_max_calls_per_minute: Option<u32>,
+    pub validate_on_startup: Option<bool>,
+    pub signing: Option<SkillSigningConfig>,
+    pub registry: Option<SkillRegistryConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillSigningConfig {
+    pub require_signatures: Option<bool>,
+    pub trusted_keys: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillRegistryConfig {
+    pub index_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PolicyConfig {
+    pub allow_job_tasks: Option<bool>,
+    pub allow_job_task_groups: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolsConfig {
+    pub web_fetch_timeout_seconds: Option<u64>,
+    pub web_fetch_max_bytes: Option<u64>,
+    pub web_fetch_allowed_domains: Option<Vec<String>>,
+    pub grep_max_file_bytes: Option<u64>,
+    pub grep_max_matches: Option<u64>,
+    pub search_max_results: Option<u64>,
+    pub auto_router_enabled: Option<bool>,
+    pub auto_router_allowlist: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SecurityConfig {
+    pub mode: Option<String>,
+}
+
+impl AppConfig {
+    pub fn load(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?;
+        let cfg = toml::from_str::<Self>(&raw).context("failed to parse TOML config")?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.database_path.trim().is_empty() {
+            return Err(anyhow!("database_path must not be empty"));
+        }
+        if self.group_root.trim().is_empty() {
+            return Err(anyhow!("group_root must not be empty"));
+        }
+        if self.runtime != "apple_container" && self.runtime != "docker" {
+            return Err(anyhow!("runtime must be one of: apple_container, docker"));
+        }
+        if self.model.provider.trim().is_empty() {
+            return Err(anyhow!("model.provider must not be empty"));
+        }
+        if self.model.api_key_env.trim().is_empty() {
+            return Err(anyhow!("model.api_key_env must not be empty"));
+        }
+        if let Some(api_envs) = &self.model.api_key_envs {
+            if api_envs.is_empty() {
+                return Err(anyhow!("model.api_key_envs must not be empty when set"));
+            }
+            for env_name in api_envs {
+                if env_name.trim().is_empty() {
+                    return Err(anyhow!("model.api_key_envs values must not be empty"));
+                }
+            }
+        }
+        if let Some(active_profile) = &self.model.active_profile {
+            if active_profile.trim().is_empty() {
+                return Err(anyhow!("model.active_profile must not be empty when set"));
+            }
+            let profiles = self
+                .model
+                .profiles
+                .as_ref()
+                .ok_or_else(|| anyhow!("model.active_profile requires model.profiles"))?;
+            let profile = profiles.get(active_profile).ok_or_else(|| {
+                anyhow!(
+                    "model.active_profile '{}' missing from model.profiles",
+                    active_profile
+                )
+            })?;
+            validate_model_profile(profile, active_profile)?;
+        }
+        if let Some(profiles) = &self.model.profiles {
+            for (name, profile) in profiles {
+                if name.trim().is_empty() {
+                    return Err(anyhow!("model.profiles keys must not be empty"));
+                }
+                validate_model_profile(profile, name)?;
+            }
+        }
+        if let Some(ops) = &self.model.ops {
+            if let Some(max_retries) = ops.max_retries {
+                if max_retries > 20 {
+                    return Err(anyhow!("model.ops.max_retries must be <= 20"));
+                }
+            }
+            if let Some(backoff) = ops.retry_backoff_ms {
+                if backoff == 0 || backoff > 60_000 {
+                    return Err(anyhow!(
+                        "model.ops.retry_backoff_ms must be between 1 and 60000"
+                    ));
+                }
+            }
+            if let Some(rpm) = ops.requests_per_minute {
+                if rpm == 0 {
+                    return Err(anyhow!("model.ops.requests_per_minute must be > 0"));
+                }
+            }
+            if let Some(rpd) = ops.requests_per_day {
+                if rpd == 0 {
+                    return Err(anyhow!("model.ops.requests_per_day must be > 0"));
+                }
+            }
+        }
+        if let Some(fallback_models) = &self.model.fallback_models {
+            for model in fallback_models {
+                if model.trim().is_empty() {
+                    return Err(anyhow!("model.fallback_models values must not be empty"));
+                }
+            }
+        }
+        if self.scheduler.tick_seconds == 0 {
+            return Err(anyhow!("scheduler.tick_seconds must be > 0"));
+        }
+        if self.scheduler.max_concurrency == 0 {
+            return Err(anyhow!("scheduler.max_concurrency must be > 0"));
+        }
+        if let Some(telegram) = &self.telegram {
+            if telegram.bot_token_env.trim().is_empty() {
+                return Err(anyhow!("telegram.bot_token_env must not be empty"));
+            }
+            if let Some(timeout) = telegram.polling_timeout_seconds {
+                if timeout == 0 {
+                    return Err(anyhow!(
+                        "telegram.polling_timeout_seconds must be > 0 when set"
+                    ));
+                }
+            }
+            if let Some(ids) = &telegram.allowed_chat_ids {
+                if ids.is_empty() {
+                    return Err(anyhow!(
+                        "telegram.allowed_chat_ids must not be empty when set"
+                    ));
+                }
+            }
+            if let Some(policy) = &telegram.dm_policy {
+                if policy != "open" && policy != "pairing" {
+                    return Err(anyhow!("telegram.dm_policy must be one of: open, pairing"));
+                }
+            }
+            if let Some(mode) = &telegram.activation_mode {
+                if mode != "always" && mode != "mention" {
+                    return Err(anyhow!(
+                        "telegram.activation_mode must be one of: always, mention"
+                    ));
+                }
+            }
+            if matches!(telegram.activation_mode.as_deref(), Some("mention")) {
+                if telegram
+                    .mention_token
+                    .as_ref()
+                    .map(|v| v.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    return Err(anyhow!(
+                        "telegram.mention_token must be set when activation_mode=mention"
+                    ));
+                }
+            }
+            if let Some(per_chat) = &telegram.per_chat_activation_mode {
+                for (chat_id, mode) in per_chat {
+                    parse_chat_id_key(chat_id)?;
+                    if mode != "always" && mode != "mention" {
+                        return Err(anyhow!(
+                            "telegram.per_chat_activation_mode values must be always|mention"
+                        ));
+                    }
+                }
+            }
+            if let Some(per_chat_token) = &telegram.per_chat_mention_token {
+                for (chat_id, token) in per_chat_token {
+                    parse_chat_id_key(chat_id)?;
+                    if token.trim().is_empty() {
+                        return Err(anyhow!(
+                            "telegram.per_chat_mention_token values must not be empty"
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(skills) = &self.skills {
+            if let Some(directory) = &skills.directory {
+                if directory.trim().is_empty() {
+                    return Err(anyhow!("skills.directory must not be empty when set"));
+                }
+            }
+            if let Some(enabled) = &skills.enabled {
+                let mut seen = std::collections::HashSet::new();
+                for name in enabled {
+                    validate_skill_name(name)?;
+                    if !seen.insert(name) {
+                        return Err(anyhow!(
+                            "skills.enabled contains duplicate skill name: {name}"
+                        ));
+                    }
+                }
+            }
+            if let Some(tool_allowlist) = &skills.tool_allowlist {
+                let mut seen = std::collections::HashSet::new();
+                for tool in tool_allowlist {
+                    validate_tool_name(tool)?;
+                    if !seen.insert(tool) {
+                        return Err(anyhow!(
+                            "skills.tool_allowlist contains duplicate tool name: {tool}"
+                        ));
+                    }
+                }
+            }
+            if let Some(max_calls) = skills.tool_max_calls_per_minute {
+                if max_calls == 0 {
+                    return Err(anyhow!(
+                        "skills.tool_max_calls_per_minute must be greater than zero when set"
+                    ));
+                }
+            }
+            if let Some(registry) = &skills.registry {
+                if let Some(index_path) = &registry.index_path {
+                    if index_path.trim().is_empty() {
+                        return Err(anyhow!("skills.registry.index_path must not be empty"));
+                    }
+                }
+            }
+            if let Some(signing) = &skills.signing {
+                if let Some(keys) = &signing.trusted_keys {
+                    for (key_id, public_key) in keys {
+                        validate_signing_key_id(key_id)?;
+                        if public_key.trim().is_empty() {
+                            return Err(anyhow!(
+                                "skills.signing.trusted_keys values must not be empty"
+                            ));
+                        }
+                    }
+                }
+                if signing.require_signatures.unwrap_or(false)
+                    && signing
+                        .trusted_keys
+                        .as_ref()
+                        .map(|keys| keys.is_empty())
+                        .unwrap_or(true)
+                {
+                    return Err(anyhow!(
+                        "skills.signing.require_signatures=true requires skills.signing.trusted_keys"
+                    ));
+                }
+            }
+        }
+        if let Some(policy) = &self.policy {
+            if let Some(groups) = &policy.allow_job_task_groups {
+                let mut seen = std::collections::HashSet::new();
+                for group in groups {
+                    if group.trim().is_empty() {
+                        return Err(anyhow!(
+                            "policy.allow_job_task_groups values must not be empty"
+                        ));
+                    }
+                    if !seen.insert(group) {
+                        return Err(anyhow!(
+                            "policy.allow_job_task_groups contains duplicate group: {group}"
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(tools) = &self.tools {
+            if let Some(timeout) = tools.web_fetch_timeout_seconds {
+                if timeout == 0 {
+                    return Err(anyhow!("tools.web_fetch_timeout_seconds must be > 0"));
+                }
+            }
+            if let Some(max_bytes) = tools.web_fetch_max_bytes {
+                if max_bytes == 0 {
+                    return Err(anyhow!("tools.web_fetch_max_bytes must be > 0"));
+                }
+            }
+            if let Some(max_bytes) = tools.grep_max_file_bytes {
+                if max_bytes == 0 {
+                    return Err(anyhow!("tools.grep_max_file_bytes must be > 0"));
+                }
+            }
+            if let Some(max_matches) = tools.grep_max_matches {
+                if max_matches == 0 {
+                    return Err(anyhow!("tools.grep_max_matches must be > 0"));
+                }
+            }
+            if let Some(max_results) = tools.search_max_results {
+                if max_results == 0 {
+                    return Err(anyhow!("tools.search_max_results must be > 0"));
+                }
+            }
+            if let Some(allowed_domains) = &tools.web_fetch_allowed_domains {
+                if allowed_domains.is_empty() {
+                    return Err(anyhow!(
+                        "tools.web_fetch_allowed_domains must not be empty when set"
+                    ));
+                }
+                for domain in allowed_domains {
+                    if domain.trim().is_empty() {
+                        return Err(anyhow!(
+                            "tools.web_fetch_allowed_domains values must not be empty"
+                        ));
+                    }
+                }
+            }
+            if let Some(auto_allowlist) = &tools.auto_router_allowlist {
+                let mut seen = std::collections::HashSet::new();
+                for tool in auto_allowlist {
+                    validate_tool_name(tool)?;
+                    if !seen.insert(tool) {
+                        return Err(anyhow!(
+                            "tools.auto_router_allowlist contains duplicate tool name: {tool}"
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(security) = &self.security {
+            if let Some(mode) = &security.mode {
+                if mode != "development" && mode != "production" {
+                    return Err(anyhow!(
+                        "security.mode must be one of: development, production"
+                    ));
+                }
+            }
+        }
+
+        if self.is_production() {
+            if self.enabled_skills().is_none() && !self.allow_unlisted_skills() {
+                return Err(anyhow!(
+                    "production mode requires skills.enabled allowlist (or skills.allow_unlisted=true)"
+                ));
+            }
+            if !self.skill_require_signatures() {
+                return Err(anyhow!(
+                    "production mode requires skills.signing.require_signatures=true"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn skill_directory(&self) -> &str {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.directory.as_deref())
+            .unwrap_or("skills")
+    }
+
+    pub fn enabled_skills(&self) -> Option<&[String]> {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.enabled.as_deref())
+    }
+
+    pub fn allow_unlisted_skills(&self) -> bool {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.allow_unlisted)
+            .unwrap_or(false)
+    }
+
+    pub fn is_skill_enabled(&self, name: &str) -> bool {
+        match self.enabled_skills() {
+            Some(enabled) => enabled.iter().any(|candidate| candidate == name),
+            None => self.allow_unlisted_skills(),
+        }
+    }
+
+    pub fn validate_skills_on_startup(&self) -> bool {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.validate_on_startup)
+            .unwrap_or_else(|| {
+                self.skills
+                    .as_ref()
+                    .and_then(|skills| skills.enabled.as_ref())
+                    .is_some()
+            })
+    }
+
+    pub fn skill_tool_allowlist(&self) -> Vec<String> {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.tool_allowlist.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn skill_tool_max_calls_per_minute(&self) -> u32 {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.tool_max_calls_per_minute)
+            .unwrap_or(60)
+    }
+
+    pub fn skill_registry_index_path(&self) -> String {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.registry.as_ref())
+            .and_then(|registry| registry.index_path.clone())
+            .unwrap_or_else(|| "skills/registry.toml".to_string())
+    }
+
+    pub fn skill_require_signatures(&self) -> bool {
+        if self.is_production() {
+            return true;
+        }
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.signing.as_ref())
+            .and_then(|signing| signing.require_signatures)
+            .unwrap_or(false)
+    }
+
+    pub fn skill_trusted_signing_keys(&self) -> BTreeMap<String, String> {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.signing.as_ref())
+            .and_then(|signing| signing.trusted_keys.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn model_api_key_envs(&self) -> Vec<String> {
+        if let Some(profile) = self.active_model_profile() {
+            if let Some(envs) = &profile.api_key_envs {
+                return envs.clone();
+            }
+            if let Some(env_name) = &profile.api_key_env {
+                return vec![env_name.clone()];
+            }
+        }
+        if let Some(envs) = &self.model.api_key_envs {
+            return envs.clone();
+        }
+        vec![self.model.api_key_env.clone()]
+    }
+
+    pub fn model_candidates(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(profile) = self.active_model_profile() {
+            if let Some(model) = &profile.model {
+                out.push(model.clone());
+            }
+            if let Some(extra) = &profile.fallback_models {
+                for model in extra {
+                    if !out.contains(model) {
+                        out.push(model.clone());
+                    }
+                }
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+        out.push(
+            self.model
+                .model
+                .clone()
+                .unwrap_or_else(|| "gpt-4.1-mini".to_string()),
+        );
+        if let Some(extra) = &self.model.fallback_models {
+            for model in extra {
+                if !out.contains(model) {
+                    out.push(model.clone());
+                }
+            }
+        }
+        out
+    }
+
+    pub fn model_provider_name(&self) -> String {
+        self.active_model_profile()
+            .and_then(|profile| profile.provider.clone())
+            .unwrap_or_else(|| self.model.provider.clone())
+    }
+
+    pub fn model_base_url(&self) -> Option<String> {
+        self.active_model_profile()
+            .and_then(|profile| profile.base_url.clone())
+            .or_else(|| self.model.base_url.clone())
+    }
+
+    pub fn model_max_retries(&self) -> u32 {
+        self.model
+            .ops
+            .as_ref()
+            .and_then(|ops| ops.max_retries)
+            .unwrap_or(2)
+    }
+
+    pub fn model_retry_backoff_ms(&self) -> u64 {
+        self.model
+            .ops
+            .as_ref()
+            .and_then(|ops| ops.retry_backoff_ms)
+            .unwrap_or(800)
+    }
+
+    pub fn model_requests_per_minute(&self) -> Option<u32> {
+        self.model
+            .ops
+            .as_ref()
+            .and_then(|ops| ops.requests_per_minute)
+    }
+
+    pub fn model_requests_per_day(&self) -> Option<u32> {
+        self.model.ops.as_ref().and_then(|ops| ops.requests_per_day)
+    }
+
+    pub fn telegram_dm_policy(&self) -> &str {
+        self.telegram
+            .as_ref()
+            .and_then(|cfg| cfg.dm_policy.as_deref())
+            .unwrap_or("open")
+    }
+
+    pub fn telegram_activation_mode(&self) -> &str {
+        self.telegram
+            .as_ref()
+            .and_then(|cfg| cfg.activation_mode.as_deref())
+            .unwrap_or("always")
+    }
+
+    pub fn telegram_mention_token(&self) -> Option<&str> {
+        self.telegram
+            .as_ref()
+            .and_then(|cfg| cfg.mention_token.as_deref())
+    }
+
+    pub fn telegram_main_chat_id(&self) -> Option<i64> {
+        self.telegram.as_ref().and_then(|cfg| cfg.main_chat_id)
+    }
+
+    pub fn telegram_per_chat_activation_mode(&self) -> BTreeMap<i64, String> {
+        parse_chat_map_string(
+            self.telegram
+                .as_ref()
+                .and_then(|cfg| cfg.per_chat_activation_mode.clone()),
+        )
+    }
+
+    pub fn telegram_per_chat_mention_token(&self) -> BTreeMap<i64, String> {
+        parse_chat_map_string(
+            self.telegram
+                .as_ref()
+                .and_then(|cfg| cfg.per_chat_mention_token.clone()),
+        )
+    }
+
+    pub fn policy_allow_job_tasks_default(&self) -> bool {
+        self.policy
+            .as_ref()
+            .and_then(|policy| policy.allow_job_tasks)
+            .or_else(|| {
+                self.telegram
+                    .as_ref()
+                    .and_then(|telegram| telegram.allow_job_tasks)
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn policy_allow_job_task_groups(&self) -> Vec<String> {
+        self.policy
+            .as_ref()
+            .and_then(|policy| policy.allow_job_task_groups.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn tool_web_fetch_timeout_seconds(&self) -> u64 {
+        self.tools
+            .as_ref()
+            .and_then(|tools| tools.web_fetch_timeout_seconds)
+            .unwrap_or(15)
+    }
+
+    pub fn tool_web_fetch_max_bytes(&self) -> u64 {
+        self.tools
+            .as_ref()
+            .and_then(|tools| tools.web_fetch_max_bytes)
+            .unwrap_or(131_072)
+    }
+
+    pub fn tool_web_fetch_allowed_domains(&self) -> Vec<String> {
+        self.tools
+            .as_ref()
+            .and_then(|tools| tools.web_fetch_allowed_domains.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn tool_grep_max_file_bytes(&self) -> u64 {
+        self.tools
+            .as_ref()
+            .and_then(|tools| tools.grep_max_file_bytes)
+            .unwrap_or(1_048_576)
+    }
+
+    pub fn tool_grep_max_matches(&self) -> u64 {
+        self.tools
+            .as_ref()
+            .and_then(|tools| tools.grep_max_matches)
+            .unwrap_or(100)
+    }
+
+    pub fn tool_search_max_results(&self) -> u64 {
+        self.tools
+            .as_ref()
+            .and_then(|tools| tools.search_max_results)
+            .unwrap_or(5)
+    }
+
+    pub fn tool_auto_router_enabled(&self) -> bool {
+        self.tools
+            .as_ref()
+            .and_then(|tools| tools.auto_router_enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn tool_auto_router_allowlist(&self) -> Vec<String> {
+        self.tools
+            .as_ref()
+            .and_then(|tools| tools.auto_router_allowlist.clone())
+            .unwrap_or_else(|| vec!["ops.web_fetch".to_string(), "ops.search".to_string()])
+    }
+
+    pub fn is_production(&self) -> bool {
+        self.security
+            .as_ref()
+            .and_then(|security| security.mode.as_deref())
+            .map(|mode| mode == "production")
+            .unwrap_or(false)
+    }
+
+    fn active_model_profile(&self) -> Option<&ModelProfileConfig> {
+        let active = self.model.active_profile.as_ref()?;
+        self.model.profiles.as_ref()?.get(active)
+    }
+}
+
+fn validate_model_profile(profile: &ModelProfileConfig, profile_name: &str) -> Result<()> {
+    if let Some(provider) = &profile.provider {
+        if provider.trim().is_empty() {
+            return Err(anyhow!(
+                "model.profiles.{}.provider must not be empty",
+                profile_name
+            ));
+        }
+    }
+    if let Some(api_key_env) = &profile.api_key_env {
+        if api_key_env.trim().is_empty() {
+            return Err(anyhow!(
+                "model.profiles.{}.api_key_env must not be empty",
+                profile_name
+            ));
+        }
+    }
+    if let Some(api_key_envs) = &profile.api_key_envs {
+        if api_key_envs.is_empty() {
+            return Err(anyhow!(
+                "model.profiles.{}.api_key_envs must not be empty when set",
+                profile_name
+            ));
+        }
+        for env_name in api_key_envs {
+            if env_name.trim().is_empty() {
+                return Err(anyhow!(
+                    "model.profiles.{}.api_key_envs values must not be empty",
+                    profile_name
+                ));
+            }
+        }
+    }
+    if let Some(model) = &profile.model {
+        if model.trim().is_empty() {
+            return Err(anyhow!(
+                "model.profiles.{}.model must not be empty",
+                profile_name
+            ));
+        }
+    }
+    if let Some(fallback_models) = &profile.fallback_models {
+        for model in fallback_models {
+            if model.trim().is_empty() {
+                return Err(anyhow!(
+                    "model.profiles.{}.fallback_models values must not be empty",
+                    profile_name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_chat_id_key(value: &str) -> Result<i64> {
+    value
+        .parse::<i64>()
+        .map_err(|_| anyhow!("invalid chat id key '{}': expected integer string", value))
+}
+
+fn parse_chat_map_string(map: Option<BTreeMap<String, String>>) -> BTreeMap<i64, String> {
+    let mut out = BTreeMap::new();
+    if let Some(map) = map {
+        for (key, value) in map {
+            if let Ok(chat_id) = key.parse::<i64>() {
+                out.insert(chat_id, value);
+            }
+        }
+    }
+    out
+}
+
+fn validate_skill_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(anyhow!("skill name must not be empty"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(anyhow!(
+            "skill name must contain only lowercase letters, digits, and hyphens"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tool_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(anyhow!("tool name must not be empty"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_')
+    {
+        return Err(anyhow!(
+            "tool name must contain only lowercase letters, digits, dots, underscores, and hyphens"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_signing_key_id(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(anyhow!("signing key id must not be empty"));
+    }
+    if !name.chars().all(|c| {
+        c.is_ascii_lowercase()
+            || c.is_ascii_uppercase()
+            || c.is_ascii_digit()
+            || c == '-'
+            || c == '_'
+            || c == '.'
+    }) {
+        return Err(anyhow!(
+            "signing key id must contain only letters, digits, dots, underscores, and hyphens"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_valid_config() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+        api_key_envs = ["OPENAI_API_KEY", "OPENAI_API_KEY_BACKUP"]
+        model = "gpt-4.1-mini"
+        fallback_models = ["gpt-4o-mini"]
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [telegram]
+        bot_token_env = "TELEGRAM_BOT_TOKEN"
+        polling_timeout_seconds = 30
+        dm_policy = "pairing"
+        activation_mode = "mention"
+        mention_token = "@maid"
+
+        [skills]
+        directory = "skills"
+        enabled = ["echo"]
+        tool_allowlist = ["group.list", "task.list", "task.create"]
+        tool_max_calls_per_minute = 30
+        validate_on_startup = true
+
+        [skills.signing]
+        require_signatures = false
+        trusted_keys = { "local.dev" = "BASE64_PUBLIC_KEY" }
+
+        [tools]
+        web_fetch_timeout_seconds = 20
+        web_fetch_max_bytes = 200000
+        web_fetch_allowed_domains = ["example.com"]
+        grep_max_file_bytes = 500000
+        grep_max_matches = 50
+        search_max_results = 8
+
+        [policy]
+        allow_job_tasks = false
+        allow_job_task_groups = ["ops"]
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        parsed.validate().unwrap();
+        assert!(parsed.is_skill_enabled("echo"));
+        assert!(!parsed.is_skill_enabled("not-enabled"));
+        assert_eq!(parsed.skill_directory(), "skills");
+        assert!(parsed.validate_skills_on_startup());
+        assert_eq!(
+            parsed.skill_tool_allowlist(),
+            vec!["group.list", "task.list", "task.create"]
+        );
+        assert_eq!(parsed.skill_tool_max_calls_per_minute(), 30);
+        assert!(!parsed.skill_require_signatures());
+        assert_eq!(parsed.skill_trusted_signing_keys().len(), 1);
+        assert_eq!(parsed.model_api_key_envs().len(), 2);
+        assert_eq!(parsed.model_candidates().len(), 2);
+        assert_eq!(parsed.telegram_dm_policy(), "pairing");
+        assert_eq!(parsed.telegram_activation_mode(), "mention");
+        assert_eq!(parsed.telegram_mention_token(), Some("@maid"));
+        assert!(!parsed.policy_allow_job_tasks_default());
+        assert_eq!(parsed.policy_allow_job_task_groups(), vec!["ops"]);
+        assert_eq!(parsed.tool_web_fetch_timeout_seconds(), 20);
+        assert_eq!(parsed.tool_web_fetch_max_bytes(), 200000);
+        assert_eq!(
+            parsed.tool_web_fetch_allowed_domains(),
+            vec!["example.com".to_string()]
+        );
+        assert_eq!(parsed.tool_grep_max_file_bytes(), 500000);
+        assert_eq!(parsed.tool_grep_max_matches(), 50);
+        assert_eq!(parsed.tool_search_max_results(), 8);
+    }
+
+    #[test]
+    fn reject_invalid_runtime() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "host"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_telegram_timeout() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [telegram]
+        bot_token_env = "TELEGRAM_BOT_TOKEN"
+        polling_timeout_seconds = 0
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn reject_empty_allowed_chat_ids() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [telegram]
+        bot_token_env = "TELEGRAM_BOT_TOKEN"
+        allowed_chat_ids = []
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_skill_name() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [skills]
+        enabled = ["BadName"]
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_tool_name_in_skill_allowlist() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [skills]
+        tool_allowlist = ["BadTool"]
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_skill_tool_rate_limit() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [skills]
+        tool_max_calls_per_minute = 0
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_telegram_policy() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [telegram]
+        bot_token_env = "TELEGRAM_BOT_TOKEN"
+        dm_policy = "unknown"
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn skills_default_to_disabled_without_allowlist() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        parsed.validate().unwrap();
+        assert!(!parsed.is_skill_enabled("anything"));
+        assert!(!parsed.validate_skills_on_startup());
+        assert_eq!(parsed.skill_directory(), "skills");
+        assert_eq!(parsed.telegram_dm_policy(), "open");
+        assert_eq!(parsed.telegram_activation_mode(), "always");
+        assert_eq!(parsed.model_candidates(), vec!["gpt-4.1-mini"]);
+        assert_eq!(parsed.skill_tool_max_calls_per_minute(), 60);
+        assert!(!parsed.skill_require_signatures());
+        assert!(parsed.skill_trusted_signing_keys().is_empty());
+        assert_eq!(parsed.tool_web_fetch_timeout_seconds(), 15);
+        assert_eq!(parsed.tool_web_fetch_max_bytes(), 131_072);
+        assert!(parsed.tool_web_fetch_allowed_domains().is_empty());
+        assert_eq!(parsed.tool_grep_max_file_bytes(), 1_048_576);
+        assert_eq!(parsed.tool_grep_max_matches(), 100);
+        assert_eq!(parsed.tool_search_max_results(), 5);
+    }
+
+    #[test]
+    fn allow_unlisted_skills_enables_default_skill_access() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [skills]
+        allow_unlisted = true
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        parsed.validate().unwrap();
+        assert!(parsed.is_skill_enabled("anything"));
+    }
+
+    #[test]
+    fn reject_skill_signing_with_missing_keys() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [skills.signing]
+        require_signatures = true
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_signing_key_id() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [skills.signing]
+        trusted_keys = { "bad key" = "abc" }
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_tools_limits() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [tools]
+        web_fetch_timeout_seconds = 0
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+}

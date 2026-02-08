@@ -1,0 +1,8 @@
+name = "echo"
+version = "0.1.0"
+description = "Simple reference skill that echoes command and args"
+executable = "./run.sh"
+capabilities = ["echo.run"]
+allowed_tools = []
+timeout_seconds = 10
+env_allowlist = []
