@@ -24,10 +24,10 @@ use maid_core::{
 use maid_model::{EchoProvider, OpenAiConfig, OpenAiProvider};
 use maid_sandbox::{build_runtime, RuntimeConfig, RuntimeKind};
 use maid_scheduler::{Schedule, SchedulerEngine};
-use maid_skill_sdk::{
-    discover_skills, generate_ed25519_keypair_pem, load_skill, parse_kv_args, run_skill_with_env,
-    sign_skill, verify_skill_signature, write_skill_signature, SkillContext, SkillRequest,
-    SkillSpec,
+use maid_plugin_sdk::{
+    discover_plugins, generate_ed25519_keypair_pem, load_plugin, parse_kv_args, run_plugin_with_env,
+    sign_plugin, verify_plugin_signature, write_plugin_signature, PluginContext, PluginRequest,
+    PluginSpec,
 };
 use maid_storage::SqliteStore;
 use reqwest::{Client, Url};
@@ -51,6 +51,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Status,
     Group {
         #[command(subcommand)]
         command: GroupCommands,
@@ -65,9 +66,13 @@ enum Commands {
         #[command(subcommand)]
         command: TaskCommands,
     },
-    Skill {
+    Subagent {
         #[command(subcommand)]
-        command: SkillCommands,
+        command: SubagentCommands,
+    },
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommands,
     },
     Tool {
         #[command(subcommand)]
@@ -126,6 +131,16 @@ enum TaskCommands {
         #[arg(long)]
         prompt: String,
     },
+    QuickAdd {
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        every_minutes: u64,
+        #[arg(long)]
+        prompt: String,
+    },
     List {
         #[arg(long)]
         group: String,
@@ -154,10 +169,22 @@ enum TaskCommands {
 }
 
 #[derive(Subcommand)]
-enum SkillCommands {
+enum SubagentCommands {
+    Run {
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value_t = 3)]
+        max_steps: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCommands {
     Registry {
         #[command(subcommand)]
-        command: SkillRegistryCommands,
+        command: PluginRegistryCommands,
     },
     Enable {
         #[arg(long)]
@@ -170,7 +197,7 @@ enum SkillCommands {
     Keygen {
         #[arg(long, default_value = "keys")]
         out_dir: PathBuf,
-        #[arg(long, default_value = "skill-signing")]
+        #[arg(long, default_value = "plugin-signing")]
         name: String,
     },
     List {
@@ -214,7 +241,7 @@ enum SkillCommands {
 }
 
 #[derive(Subcommand)]
-enum SkillRegistryCommands {
+enum PluginRegistryCommands {
     List {
         #[arg(long)]
         query: Option<String>,
@@ -598,9 +625,9 @@ struct GatewayCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SkillToolSession {
+struct PluginToolSession {
     version: u32,
-    skill_name: String,
+    plugin_name: String,
     token: String,
     allowed_tools: Vec<String>,
     max_calls_per_minute: u32,
@@ -635,8 +662,8 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to create db parent for {}", cfg.database_path))?;
     std::fs::create_dir_all(&cfg.group_root)
         .with_context(|| format!("failed to create group root {}", cfg.group_root))?;
-    std::fs::create_dir_all(cfg.skill_directory())
-        .with_context(|| format!("failed to create skills dir {}", cfg.skill_directory()))?;
+    std::fs::create_dir_all(cfg.plugin_directory())
+        .with_context(|| format!("failed to create plugins dir {}", cfg.plugin_directory()))?;
 
     let store = Arc::new(SqliteStore::connect(&cfg.database_path).await?);
     let migration_dir = cli
@@ -647,14 +674,18 @@ async fn main() -> Result<()> {
     store.apply_migrations_from_dir(&migration_dir).await?;
 
     match cli.command {
+        Commands::Status => {
+            let service = build_service(&cfg, &cli.config, store.clone(), false)?;
+            run_status(&cfg, service).await?;
+        }
         Commands::Onboard => {
             run_onboard(&cfg, &cli.config).await?;
         }
         Commands::Doctor => {
             run_doctor(&cfg, &cli.config).await?;
         }
-        Commands::Skill { command } => {
-            handle_skill_command(&cfg, &cli.config, command).await?;
+        Commands::Plugin { command } => {
+            handle_plugin_command(&cfg, &cli.config, command).await?;
         }
         Commands::Tool { command } => {
             let service = build_service(&cfg, &cli.config, store.clone(), false)?;
@@ -689,6 +720,10 @@ async fn main() -> Result<()> {
             let service = build_service(&cfg, &cli.config, store.clone(), needs_model)?;
             handle_task_command(service, command).await?;
         }
+        Commands::Subagent { command } => {
+            let service = build_service(&cfg, &cli.config, store.clone(), true)?;
+            handle_subagent_command(&cfg, service, command).await?;
+        }
         Commands::Pairing { command } => {
             let service = build_service(&cfg, &cli.config, store.clone(), false)?;
             handle_pairing_command(service, command).await?;
@@ -707,24 +742,24 @@ async fn main() -> Result<()> {
             run_health_checks(&cfg, gateway_port).await?;
         }
         Commands::Daemon => {
-            validate_skills_for_startup(&cfg)?;
+            validate_plugins_for_startup(&cfg)?;
             let service = build_service(&cfg, &cli.config, store.clone(), true)?;
             let scheduler_executor = build_scheduler_executor(&cfg, store.clone(), service, None)?;
             run_scheduler_daemon(&cfg, store.clone(), scheduler_executor).await?;
         }
         Commands::Telegram => {
-            validate_skills_for_startup(&cfg)?;
+            validate_plugins_for_startup(&cfg)?;
             let service = build_service(&cfg, &cli.config, store.clone(), true)?;
             let (bot, handler) = build_telegram_runtime(&cfg, service)?;
             bot.run_until_shutdown(handler).await?;
         }
         Commands::Serve => {
-            validate_skills_for_startup(&cfg)?;
+            validate_plugins_for_startup(&cfg)?;
             let service = build_service(&cfg, &cli.config, store.clone(), true)?;
             run_serve(&cfg, store.clone(), service, None).await?;
         }
         Commands::Gateway { port } => {
-            validate_skills_for_startup(&cfg)?;
+            validate_plugins_for_startup(&cfg)?;
             let service = build_service(&cfg, &cli.config, store.clone(), true)?;
             run_gateway(&cfg, store.clone(), service, port).await?;
         }
@@ -748,6 +783,28 @@ async fn handle_task_command(service: Arc<AppService>, command: TaskCommands) ->
                 .create_task(&group, &name, &schedule, &prompt, "cli")
                 .await?;
             println!("created task '{}' ({})", task.name, task.id);
+        }
+        TaskCommands::QuickAdd {
+            group,
+            name,
+            every_minutes,
+            prompt,
+        } => {
+            if every_minutes == 0 || every_minutes > 1_440 {
+                return Err(anyhow!(
+                    "--every-minutes must be between 1 and 1440 (got {every_minutes})"
+                ));
+            }
+            let schedule = format!("FREQ=MINUTELY;INTERVAL={every_minutes}");
+            Schedule::parse_rrule(&schedule)
+                .with_context(|| format!("invalid generated schedule RRULE: {}", schedule))?;
+            let task = service
+                .create_task(&group, &name, &schedule, &prompt, "cli")
+                .await?;
+            println!(
+                "created task '{}' ({}) with schedule {}",
+                task.name, task.id, schedule
+            );
         }
         TaskCommands::List { group } => {
             let tasks = service.list_tasks(&group).await?;
@@ -807,6 +864,238 @@ async fn handle_task_command(service: Arc<AppService>, command: TaskCommands) ->
     Ok(())
 }
 
+async fn run_status(cfg: &AppConfig, service: Arc<AppService>) -> Result<()> {
+    let groups = service.list_groups().await?;
+    let mut tasks_total = 0_usize;
+    let mut tasks_active = 0_usize;
+    let mut tasks_paused = 0_usize;
+    for group in &groups {
+        let tasks = service.list_tasks(&group.name).await?;
+        tasks_total += tasks.len();
+        for task in tasks {
+            match task.status.as_str() {
+                "ACTIVE" => tasks_active += 1,
+                "PAUSED" => tasks_paused += 1,
+                _ => {}
+            }
+        }
+    }
+
+    let plugins = discover_plugins(Path::new(cfg.plugin_directory()))?;
+    let enabled_plugins = plugins
+        .iter()
+        .filter(|plugin| cfg.is_plugin_enabled(&plugin.manifest.name))
+        .count();
+
+    println!("runtime: {}", cfg.runtime);
+    println!("groups: {}", groups.len());
+    println!("tasks_total: {}", tasks_total);
+    println!("tasks_active: {}", tasks_active);
+    println!("tasks_paused: {}", tasks_paused);
+    println!(
+        "plugins: {} total / {} enabled ({})",
+        plugins.len(),
+        enabled_plugins,
+        cfg.plugin_directory()
+    );
+    println!("skills: {}", cfg.enabled_skills().join(", "));
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SubagentPlan {
+    #[serde(default)]
+    rationale: Option<String>,
+    #[serde(default)]
+    final_instruction: Option<String>,
+    #[serde(default)]
+    steps: Vec<SubagentStep>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SubagentStep {
+    name: String,
+    prompt: String,
+}
+
+async fn handle_subagent_command(
+    cfg: &AppConfig,
+    service: Arc<AppService>,
+    command: SubagentCommands,
+) -> Result<()> {
+    match command {
+        SubagentCommands::Run {
+            group,
+            prompt,
+            max_steps,
+        } => {
+            let bounded_steps = max_steps.clamp(1, 8);
+            let plan = request_subagent_plan(service.clone(), &group, &prompt, bounded_steps).await?;
+            let mut steps = plan.steps;
+            if steps.is_empty() {
+                steps.push(SubagentStep {
+                    name: "direct".to_string(),
+                    prompt: prompt.clone(),
+                });
+            }
+            steps.truncate(bounded_steps);
+
+            let mut step_outputs = Vec::new();
+            for (idx, step) in steps.iter().enumerate() {
+                let step_prompt = format!(
+                    "Subagent executor step {}/{}: {}\n\nTask:\n{}\n\nOriginal user goal:\n{}",
+                    idx + 1,
+                    steps.len(),
+                    step.name,
+                    step.prompt,
+                    prompt
+                );
+                let output = run_prompt_with_auto_tools(
+                    cfg,
+                    service.clone(),
+                    &group,
+                    &step_prompt,
+                    "subagent-executor",
+                )
+                .await?;
+                step_outputs.push(json!({
+                    "step": idx + 1,
+                    "name": step.name,
+                    "output": truncate_line(&output, 1800),
+                }));
+            }
+
+            let final_instruction = plan
+                .final_instruction
+                .unwrap_or_else(|| "Synthesize a final answer for the user goal.".to_string());
+            let final_prompt = format!(
+                "You are the finalizer in a planner/executor subagent pipeline.\n\
+Original user goal:\n{}\n\n\
+Planner rationale:\n{}\n\n\
+Executor outputs (JSON):\n{}\n\n\
+Instruction:\n{}\n\n\
+Return the final user-facing answer only.",
+                prompt,
+                plan.rationale.unwrap_or_else(|| "none".to_string()),
+                serde_json::to_string_pretty(&step_outputs)?,
+                final_instruction
+            );
+            let final_output = run_prompt_with_auto_tools(
+                cfg,
+                service.clone(),
+                &group,
+                &final_prompt,
+                "subagent-finalizer",
+            )
+            .await?;
+
+            let _ = service
+                .store
+                .insert_audit(NewAudit {
+                    group_id: None,
+                    action: "SUBAGENT_RUN".to_string(),
+                    actor: "cli".to_string(),
+                    result: "SUCCESS".to_string(),
+                    created_at: Utc::now(),
+                    metadata_json: Some(json!({
+                        "group": group,
+                        "max_steps": bounded_steps,
+                        "executed_steps": step_outputs.len(),
+                    })),
+                })
+                .await;
+
+            println!("{final_output}");
+        }
+    }
+    Ok(())
+}
+
+async fn request_subagent_plan(
+    service: Arc<AppService>,
+    group_name: &str,
+    prompt: &str,
+    max_steps: usize,
+) -> Result<SubagentPlan> {
+    let planner_prompt = format!(
+        "You are a planning subagent.\n\
+Return ONLY JSON with schema:\n\
+{{\"rationale\":\"short reason\",\"final_instruction\":\"string\",\"steps\":[{{\"name\":\"short\",\"prompt\":\"exact task\"}}]}}\n\
+Rules:\n\
+- At most {} steps.\n\
+- Keep steps concrete and executable.\n\
+- If no decomposition is needed, return one direct step.\n\
+- No markdown, no extra text.\n\n\
+Group: {}\n\
+User goal:\n{}",
+        max_steps, group_name, prompt
+    );
+
+    let output = service
+        .model
+        .run(ModelRunRequest {
+            group_name: group_name.to_string(),
+            prompt: planner_prompt,
+            history: Vec::new(),
+        })
+        .await?
+        .output_text;
+
+    parse_subagent_plan(&output)
+}
+
+fn parse_subagent_plan(raw: &str) -> Result<SubagentPlan> {
+    let parsed = serde_json::from_str::<serde_json::Value>(raw.trim()).or_else(|_| {
+        let extracted = extract_json_object(raw)
+            .ok_or_else(|| anyhow!("subagent planner did not return valid JSON"))?;
+        serde_json::from_str::<serde_json::Value>(&extracted)
+            .context("failed to parse subagent planner JSON")
+    })?;
+    normalize_subagent_plan(parsed)
+}
+
+fn normalize_subagent_plan(value: serde_json::Value) -> Result<SubagentPlan> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("subagent planner payload must be a JSON object"))?;
+    let rationale = object
+        .get("rationale")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let final_instruction = object
+        .get("final_instruction")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+
+    let mut steps = Vec::new();
+    if let Some(items) = object.get("steps").and_then(|v| v.as_array()) {
+        for item in items {
+            let Some(step_obj) = item.as_object() else {
+                continue;
+            };
+            let Some(name) = step_obj.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(prompt) = step_obj.get("prompt").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if name.trim().is_empty() || prompt.trim().is_empty() {
+                continue;
+            }
+            steps.push(SubagentStep {
+                name: name.to_string(),
+                prompt: prompt.to_string(),
+            });
+        }
+    }
+
+    Ok(SubagentPlan {
+        rationale,
+        final_instruction,
+        steps,
+    })
+}
+
 async fn run_prompt_with_auto_tools(
     cfg: &AppConfig,
     service: Arc<AppService>,
@@ -814,6 +1103,15 @@ async fn run_prompt_with_auto_tools(
     prompt: &str,
     actor: &str,
 ) -> Result<String> {
+    let skill_context = match auto_invoke_skills_for_prompt(cfg, service.clone(), group_name, actor).await
+    {
+        Ok(context) => context,
+        Err(err) => {
+            warn!("{actor} skill context failed: {err:#}");
+            None
+        }
+    };
+
     let tool_context = if cfg.tool_auto_router_enabled() {
         auto_route_tools_for_prompt(cfg, service.clone(), group_name, prompt, actor).await
     } else {
@@ -821,14 +1119,28 @@ async fn run_prompt_with_auto_tools(
     };
 
     match tool_context {
-        Ok(Some(context)) => {
-            let augmented_prompt =
-                format!("{prompt}\n\nTool context:\n{context}\n\nUse this data if relevant.");
-            service
-                .run_prompt(group_name, &augmented_prompt, actor)
-                .await
+        Ok(tool_context) => {
+            let mut sections = Vec::new();
+            if let Some(context) = skill_context {
+                sections.push(("Skill context", context));
+            }
+            if let Some(context) = tool_context {
+                sections.push(("Tool context", context));
+            }
+            if sections.is_empty() {
+                return service.run_prompt(group_name, prompt, actor).await;
+            }
+
+            let mut augmented_prompt = prompt.to_string();
+            for (label, context) in sections {
+                augmented_prompt.push_str("\n\n");
+                augmented_prompt.push_str(label);
+                augmented_prompt.push_str(":\n");
+                augmented_prompt.push_str(&context);
+            }
+            augmented_prompt.push_str("\n\nUse this context if relevant.");
+            service.run_prompt(group_name, &augmented_prompt, actor).await
         }
-        Ok(None) => service.run_prompt(group_name, prompt, actor).await,
         Err(err) => {
             warn!("{actor} auto-router failed: {err:#}");
             service.run_prompt(group_name, prompt, actor).await
@@ -1138,26 +1450,26 @@ async fn report_service_status() -> Result<()> {
     Ok(())
 }
 
-async fn handle_skill_command(
+async fn handle_plugin_command(
     cfg: &AppConfig,
     config_path: &Path,
-    command: SkillCommands,
+    command: PluginCommands,
 ) -> Result<()> {
     match command {
-        SkillCommands::Registry { command } => {
-            handle_skill_registry_command(cfg, command).await?;
+        PluginCommands::Registry { command } => {
+            handle_plugin_registry_command(cfg, command).await?;
         }
-        SkillCommands::Enable { name } => {
-            validate_skill_name(&name)?;
-            set_skill_enabled_in_config(config_path, &name, true)?;
-            println!("enabled skill '{}' in {}", name, config_path.display());
+        PluginCommands::Enable { name } => {
+            validate_plugin_name(&name)?;
+            set_plugin_enabled_in_config(config_path, &name, true)?;
+            println!("enabled plugin '{}' in {}", name, config_path.display());
         }
-        SkillCommands::Disable { name } => {
-            validate_skill_name(&name)?;
-            set_skill_enabled_in_config(config_path, &name, false)?;
-            println!("disabled skill '{}' in {}", name, config_path.display());
+        PluginCommands::Disable { name } => {
+            validate_plugin_name(&name)?;
+            set_plugin_enabled_in_config(config_path, &name, false)?;
+            println!("disabled plugin '{}' in {}", name, config_path.display());
         }
-        SkillCommands::Keygen { out_dir, name } => {
+        PluginCommands::Keygen { out_dir, name } => {
             let (private_key, public_key) = generate_ed25519_keypair_pem()?;
             std::fs::create_dir_all(&out_dir).with_context(|| {
                 format!("failed to create key output dir {}", out_dir.display())
@@ -1171,90 +1483,90 @@ async fn handle_skill_command(
             println!("wrote private key: {}", private_path.display());
             println!("wrote public key: {}", public_path.display());
         }
-        SkillCommands::List { dir } => {
-            let skills_dir = resolve_skills_dir(cfg, dir);
-            let skills = discover_skills(&skills_dir)?;
-            if skills.is_empty() {
-                println!("no skills found in {}", skills_dir.display());
+        PluginCommands::List { dir } => {
+            let plugins_dir = resolve_plugins_dir(cfg, dir);
+            let plugins = discover_plugins(&plugins_dir)?;
+            if plugins.is_empty() {
+                println!("no plugins found in {}", plugins_dir.display());
             } else {
-                for skill in skills {
-                    let enabled = if cfg.is_skill_enabled(&skill.manifest.name) {
+                for plugin in plugins {
+                    let enabled = if cfg.is_plugin_enabled(&plugin.manifest.name) {
                         "enabled"
                     } else {
                         "disabled"
                     };
                     println!(
                         "{}\t{}\t{}\t{}",
-                        skill.manifest.name,
-                        skill.manifest.version,
+                        plugin.manifest.name,
+                        plugin.manifest.version,
                         enabled,
-                        skill.manifest.description.unwrap_or_default()
+                        plugin.manifest.description.unwrap_or_default()
                     );
                 }
             }
         }
-        SkillCommands::Validate { name, dir } => {
-            ensure_skill_enabled(cfg, &name)?;
-            let skills_dir = resolve_skills_dir(cfg, dir);
-            let skill = load_skill(&skills_dir, &name)?;
-            enforce_skill_signature_policy(cfg, &skill, false)?;
+        PluginCommands::Validate { name, dir } => {
+            ensure_plugin_enabled(cfg, &name)?;
+            let plugins_dir = resolve_plugins_dir(cfg, dir);
+            let plugin = load_plugin(&plugins_dir, &name)?;
+            enforce_plugin_signature_policy(cfg, &plugin, false)?;
             println!(
-                "valid skill '{}' v{} ({})",
-                skill.manifest.name,
-                skill.manifest.version,
-                skill.manifest_path.display()
+                "valid plugin '{}' v{} ({})",
+                plugin.manifest.name,
+                plugin.manifest.version,
+                plugin.manifest_path.display()
             );
         }
-        SkillCommands::Sign {
+        PluginCommands::Sign {
             name,
             key_id,
             private_key_file,
             dir,
         } => {
-            let skills_dir = resolve_skills_dir(cfg, dir);
-            let skill = load_skill(&skills_dir, &name)?;
+            let plugins_dir = resolve_plugins_dir(cfg, dir);
+            let plugin = load_plugin(&plugins_dir, &name)?;
             if !private_key_file.exists() {
                 return Err(anyhow!(
                     "private key file not found: {}",
                     private_key_file.display()
                 ));
             }
-            let signature = sign_skill(&skill, &key_id, &private_key_file)?;
-            write_skill_signature(&skill.manifest_path, &key_id, &signature)?;
+            let signature = sign_plugin(&plugin, &key_id, &private_key_file)?;
+            write_plugin_signature(&plugin.manifest_path, &key_id, &signature)?;
             println!(
-                "signed skill '{}' with key '{}' ({})",
-                skill.manifest.name,
+                "signed plugin '{}' with key '{}' ({})",
+                plugin.manifest.name,
                 key_id,
-                skill.manifest_path.display()
+                plugin.manifest_path.display()
             );
         }
-        SkillCommands::Verify { name, dir } => {
-            let skills_dir = resolve_skills_dir(cfg, dir);
-            let skill = load_skill(&skills_dir, &name)?;
-            enforce_skill_signature_policy(cfg, &skill, true)?;
+        PluginCommands::Verify { name, dir } => {
+            let plugins_dir = resolve_plugins_dir(cfg, dir);
+            let plugin = load_plugin(&plugins_dir, &name)?;
+            enforce_plugin_signature_policy(cfg, &plugin, true)?;
             println!(
-                "verified signature for skill '{}' ({})",
-                skill.manifest.name,
-                skill.manifest_path.display()
+                "verified signature for plugin '{}' ({})",
+                plugin.manifest.name,
+                plugin.manifest_path.display()
             );
         }
-        SkillCommands::Run {
+        PluginCommands::Run {
             name,
             command,
             args,
             input,
             dir,
         } => {
-            ensure_skill_enabled(cfg, &name)?;
-            let skills_dir = resolve_skills_dir(cfg, dir);
-            let skill = load_skill(&skills_dir, &name)?;
-            enforce_skill_signature_policy(cfg, &skill, false)?;
+            ensure_plugin_enabled(cfg, &name)?;
+            let plugins_dir = resolve_plugins_dir(cfg, dir);
+            let plugin = load_plugin(&plugins_dir, &name)?;
+            enforce_plugin_signature_policy(cfg, &plugin, false)?;
             let args = parse_kv_args(&args)?;
-            let request = SkillRequest {
+            let request = PluginRequest {
                 command,
                 args,
                 input,
-                context: SkillContext {
+                context: PluginContext {
                     actor: "cli".to_string(),
                     cwd: std::env::current_dir()
                         .unwrap_or_else(|_| PathBuf::from("."))
@@ -1262,29 +1574,29 @@ async fn handle_skill_command(
                         .to_string(),
                 },
             };
-            let bridge = create_skill_tool_bridge_session(cfg, &skill)?;
+            let bridge = create_plugin_tool_bridge_session(cfg, &plugin)?;
             let mut extra_env = vec![
                 ("MAID_CONFIG".to_string(), config_path.display().to_string()),
-                ("MAID_SKILL_NAME".to_string(), skill.manifest.name.clone()),
+                ("MAID_PLUGIN_NAME".to_string(), plugin.manifest.name.clone()),
             ];
             if let Ok(exe) = std::env::current_exe() {
                 extra_env.push(("MAID_BIN".to_string(), exe.display().to_string()));
             }
             if let Some(session) = &bridge {
                 extra_env.push((
-                    "MAID_SKILL_TOOL_SESSION".to_string(),
+                    "MAID_PLUGIN_TOOL_SESSION".to_string(),
                     session.path.display().to_string(),
                 ));
-                extra_env.push(("MAID_SKILL_TOOL_TOKEN".to_string(), session.token.clone()));
+                extra_env.push(("MAID_PLUGIN_TOOL_TOKEN".to_string(), session.token.clone()));
             }
 
-            let run_result = run_skill_with_env(&skill, request, &extra_env).await;
+            let run_result = run_plugin_with_env(&plugin, request, &extra_env).await;
             if let Some(session) = bridge {
                 let _ = std::fs::remove_file(&session.path);
             }
             let response = run_result?;
             if !response.ok {
-                return Err(anyhow!("skill returned error: {}", response.message));
+                return Err(anyhow!("plugin returned error: {}", response.message));
             }
             println!("{}", response.message);
             if let Some(output) = response.output {
@@ -1299,15 +1611,15 @@ async fn handle_skill_command(
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct SkillRegistryFile {
+struct PluginRegistryFile {
     #[serde(default)]
-    skill: Vec<SkillRegistryEntry>,
+    plugin: Vec<PluginRegistryEntry>,
     #[serde(default)]
-    skills: Vec<SkillRegistryEntry>,
+    plugins: Vec<PluginRegistryEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct SkillRegistryEntry {
+struct PluginRegistryEntry {
     name: String,
     version: String,
     description: Option<String>,
@@ -1315,14 +1627,14 @@ struct SkillRegistryEntry {
     subdir: Option<String>,
 }
 
-async fn handle_skill_registry_command(
+async fn handle_plugin_registry_command(
     cfg: &AppConfig,
-    command: SkillRegistryCommands,
+    command: PluginRegistryCommands,
 ) -> Result<()> {
     match command {
-        SkillRegistryCommands::List { query, index } => {
+        PluginRegistryCommands::List { query, index } => {
             let index_path = resolve_registry_index_path(cfg, index);
-            let entries = load_skill_registry(&index_path)?;
+            let entries = load_plugin_registry(&index_path)?;
             let needle = query.map(|v| v.to_ascii_lowercase()).unwrap_or_default();
 
             for entry in entries.into_iter().filter(|entry| {
@@ -1344,56 +1656,56 @@ async fn handle_skill_registry_command(
                 );
             }
         }
-        SkillRegistryCommands::Install {
+        PluginRegistryCommands::Install {
             name,
             version,
             index,
             dir,
         } => {
             let index_path = resolve_registry_index_path(cfg, index);
-            let entries = load_skill_registry(&index_path)?;
+            let entries = load_plugin_registry(&index_path)?;
             let entry = select_registry_entry(&entries, &name, version.as_deref())?;
-            let skills_dir = resolve_skills_dir(cfg, dir);
-            install_skill_from_registry(&index_path, &skills_dir, entry)?;
-            let spec = load_skill(&skills_dir, &name)?;
-            enforce_skill_signature_policy(cfg, &spec, false)?;
+            let plugins_dir = resolve_plugins_dir(cfg, dir);
+            install_plugin_from_registry(&index_path, &plugins_dir, entry)?;
+            let spec = load_plugin(&plugins_dir, &name)?;
+            enforce_plugin_signature_policy(cfg, &spec, false)?;
             println!(
-                "installed skill '{}' v{} from {}",
+                "installed plugin '{}' v{} from {}",
                 spec.manifest.name,
                 spec.manifest.version,
                 index_path.display()
             );
         }
-        SkillRegistryCommands::Update { name, index, dir } => {
-            let skills_dir = resolve_skills_dir(cfg, dir);
-            let installed = load_skill(&skills_dir, &name)?;
+        PluginRegistryCommands::Update { name, index, dir } => {
+            let plugins_dir = resolve_plugins_dir(cfg, dir);
+            let installed = load_plugin(&plugins_dir, &name)?;
             let index_path = resolve_registry_index_path(cfg, index);
-            let entries = load_skill_registry(&index_path)?;
+            let entries = load_plugin_registry(&index_path)?;
             let latest = select_registry_entry(&entries, &name, None)?;
             if compare_versions(&latest.version, &installed.manifest.version)
                 != std::cmp::Ordering::Greater
             {
                 println!(
-                    "skill '{}' is up to date at v{}",
+                    "plugin '{}' is up to date at v{}",
                     installed.manifest.name, installed.manifest.version
                 );
                 return Ok(());
             }
 
-            let stage_root = skills_dir.join(format!(".stage-{}", maid_core::new_id()));
+            let stage_root = plugins_dir.join(format!(".stage-{}", maid_core::new_id()));
             std::fs::create_dir_all(&stage_root)
                 .with_context(|| format!("failed to create {}", stage_root.display()))?;
-            install_skill_from_registry(&index_path, &stage_root, latest)?;
+            install_plugin_from_registry(&index_path, &stage_root, latest)?;
 
             let staged = stage_root.join(&name);
             if !staged.exists() {
-                return Err(anyhow!("staged skill missing at {}", staged.display()));
+                return Err(anyhow!("staged plugin missing at {}", staged.display()));
             }
-            let target = skills_dir.join(&name);
-            let backup = skills_dir.join(format!(".backup-{}-{}", name, maid_core::new_id()));
+            let target = plugins_dir.join(&name);
+            let backup = plugins_dir.join(format!(".backup-{}-{}", name, maid_core::new_id()));
             std::fs::rename(&target, &backup).with_context(|| {
                 format!(
-                    "failed to move current skill {} to backup",
+                    "failed to move current plugin {} to backup",
                     target.display()
                 )
             })?;
@@ -1402,10 +1714,10 @@ async fn handle_skill_registry_command(
             std::fs::remove_dir_all(&backup).ok();
             std::fs::remove_dir_all(&stage_root).ok();
 
-            let spec = load_skill(&skills_dir, &name)?;
-            enforce_skill_signature_policy(cfg, &spec, false)?;
+            let spec = load_plugin(&plugins_dir, &name)?;
+            enforce_plugin_signature_policy(cfg, &spec, false)?;
             println!(
-                "updated skill '{}' from v{} to v{}",
+                "updated plugin '{}' from v{} to v{}",
                 name, installed.manifest.version, spec.manifest.version
             );
         }
@@ -1415,24 +1727,24 @@ async fn handle_skill_registry_command(
 }
 
 fn resolve_registry_index_path(cfg: &AppConfig, override_path: Option<PathBuf>) -> PathBuf {
-    override_path.unwrap_or_else(|| PathBuf::from(cfg.skill_registry_index_path()))
+    override_path.unwrap_or_else(|| PathBuf::from(cfg.plugin_registry_index_path()))
 }
 
-fn load_skill_registry(index_path: &Path) -> Result<Vec<SkillRegistryEntry>> {
+fn load_plugin_registry(index_path: &Path) -> Result<Vec<PluginRegistryEntry>> {
     let raw = std::fs::read_to_string(index_path)
-        .with_context(|| format!("failed to read skill registry {}", index_path.display()))?;
-    let parsed: SkillRegistryFile = toml::from_str(&raw)
-        .with_context(|| format!("failed to parse skill registry {}", index_path.display()))?;
-    let mut entries = parsed.skill;
-    entries.extend(parsed.skills);
+        .with_context(|| format!("failed to read plugin registry {}", index_path.display()))?;
+    let parsed: PluginRegistryFile = toml::from_str(&raw)
+        .with_context(|| format!("failed to parse plugin registry {}", index_path.display()))?;
+    let mut entries = parsed.plugin;
+    entries.extend(parsed.plugins);
     if entries.is_empty() {
         return Err(anyhow!(
-            "skill registry has no entries: {}",
+            "plugin registry has no entries: {}",
             index_path.display()
         ));
     }
     for entry in &entries {
-        validate_skill_registry_entry(entry)?;
+        validate_plugin_registry_entry(entry)?;
     }
     entries.sort_by(|a, b| {
         if a.name == b.name {
@@ -1444,8 +1756,8 @@ fn load_skill_registry(index_path: &Path) -> Result<Vec<SkillRegistryEntry>> {
     Ok(entries)
 }
 
-fn validate_skill_registry_entry(entry: &SkillRegistryEntry) -> Result<()> {
-    validate_skill_name(&entry.name)?;
+fn validate_plugin_registry_entry(entry: &PluginRegistryEntry) -> Result<()> {
+    validate_plugin_name(&entry.name)?;
     if entry.version.trim().is_empty() {
         return Err(anyhow!("registry entry '{}' has empty version", entry.name));
     }
@@ -1464,16 +1776,16 @@ fn validate_skill_registry_entry(entry: &SkillRegistryEntry) -> Result<()> {
 }
 
 fn select_registry_entry<'a>(
-    entries: &'a [SkillRegistryEntry],
+    entries: &'a [PluginRegistryEntry],
     name: &str,
     version: Option<&str>,
-) -> Result<&'a SkillRegistryEntry> {
+) -> Result<&'a PluginRegistryEntry> {
     let mut matches = entries
         .iter()
         .filter(|entry| entry.name == name)
         .collect::<Vec<_>>();
     if matches.is_empty() {
-        return Err(anyhow!("skill '{}' not found in registry", name));
+        return Err(anyhow!("plugin '{}' not found in registry", name));
     }
     matches.sort_by(|a, b| compare_versions(&b.version, &a.version));
 
@@ -1481,15 +1793,15 @@ fn select_registry_entry<'a>(
         return matches
             .into_iter()
             .find(|entry| entry.version == version)
-            .ok_or_else(|| anyhow!("skill '{}' version '{}' not found", name, version));
+            .ok_or_else(|| anyhow!("plugin '{}' version '{}' not found", name, version));
     }
     Ok(matches[0])
 }
 
-fn install_skill_from_registry(
+fn install_plugin_from_registry(
     index_path: &Path,
     destination_root: &Path,
-    entry: &SkillRegistryEntry,
+    entry: &PluginRegistryEntry,
 ) -> Result<()> {
     std::fs::create_dir_all(destination_root)
         .with_context(|| format!("failed to create {}", destination_root.display()))?;
@@ -1517,7 +1829,7 @@ fn install_skill_from_registry(
     }
 
     copy_dir_recursive(&source, &destination)?;
-    let spec = load_skill(destination_root, &entry.name)?;
+    let spec = load_plugin(destination_root, &entry.name)?;
     if spec.manifest.version != entry.version {
         std::fs::remove_dir_all(&destination).ok();
         return Err(anyhow!(
@@ -1533,12 +1845,12 @@ fn install_skill_from_registry(
     Ok(())
 }
 
-fn resolve_registry_source(index_path: &Path, entry: &SkillRegistryEntry) -> Result<PathBuf> {
+fn resolve_registry_source(index_path: &Path, entry: &PluginRegistryEntry) -> Result<PathBuf> {
     let source = entry.source.trim();
     if is_git_source(source) {
         let git_url = source.strip_prefix("git+").unwrap_or(source);
         let clone_dir = std::env::temp_dir().join(format!(
-            "maid-skill-registry-{}-{}",
+            "maid-plugin-registry-{}-{}",
             entry.name,
             maid_core::new_id()
         ));
@@ -1594,7 +1906,7 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
             .with_context(|| format!("failed to stat {}", entry_path.display()))?;
         if metadata.file_type().is_symlink() {
             return Err(anyhow!(
-                "symlinks are not allowed in skill registry sources: {}",
+                "symlinks are not allowed in plugin registry sources: {}",
                 entry_path.display()
             ));
         }
@@ -1648,22 +1960,22 @@ fn parse_semver_like(value: &str) -> Vec<u64> {
         .collect()
 }
 
-fn validate_skill_name(name: &str) -> Result<()> {
+fn validate_plugin_name(name: &str) -> Result<()> {
     if name.trim().is_empty() {
-        return Err(anyhow!("skill name must not be empty"));
+        return Err(anyhow!("plugin name must not be empty"));
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         return Err(anyhow!(
-            "skill name must contain only lowercase letters, digits, and hyphens"
+            "plugin name must contain only lowercase letters, digits, and hyphens"
         ));
     }
     Ok(())
 }
 
-fn set_skill_enabled_in_config(config_path: &Path, name: &str, enabled: bool) -> Result<()> {
+fn set_plugin_enabled_in_config(config_path: &Path, name: &str, enabled: bool) -> Result<()> {
     let raw = std::fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let mut root: toml::Value = toml::from_str(&raw)
@@ -1672,15 +1984,15 @@ fn set_skill_enabled_in_config(config_path: &Path, name: &str, enabled: bool) ->
         .as_table_mut()
         .ok_or_else(|| anyhow!("config root must be a TOML table"))?;
 
-    if !root_table.contains_key("skills") {
-        root_table.insert("skills".to_string(), toml::Value::Table(toml::Table::new()));
+    if !root_table.contains_key("plugins") {
+        root_table.insert("plugins".to_string(), toml::Value::Table(toml::Table::new()));
     }
-    let skills_table = root_table
-        .get_mut("skills")
+    let plugins_table = root_table
+        .get_mut("plugins")
         .and_then(toml::Value::as_table_mut)
-        .ok_or_else(|| anyhow!("skills config must be a TOML table"))?;
+        .ok_or_else(|| anyhow!("plugins config must be a TOML table"))?;
 
-    let mut enabled_values = skills_table
+    let mut enabled_values = plugins_table
         .get("enabled")
         .and_then(toml::Value::as_array)
         .cloned()
@@ -1702,7 +2014,7 @@ fn set_skill_enabled_in_config(config_path: &Path, name: &str, enabled: bool) ->
         .into_iter()
         .map(toml::Value::String)
         .collect::<Vec<_>>();
-    skills_table.insert("enabled".to_string(), toml::Value::Array(enabled_array));
+    plugins_table.insert("enabled".to_string(), toml::Value::Array(enabled_array));
 
     let updated = toml::to_string_pretty(&root)
         .with_context(|| format!("failed to serialize {}", config_path.display()))?;
@@ -1712,57 +2024,57 @@ fn set_skill_enabled_in_config(config_path: &Path, name: &str, enabled: bool) ->
 }
 
 #[derive(Debug, Clone)]
-struct SkillToolBridgeSessionHandle {
+struct PluginToolBridgeSessionHandle {
     path: PathBuf,
     token: String,
 }
 
-fn create_skill_tool_bridge_session(
+fn create_plugin_tool_bridge_session(
     cfg: &AppConfig,
-    skill: &SkillSpec,
-) -> Result<Option<SkillToolBridgeSessionHandle>> {
-    let allowed_tools = resolve_allowed_skill_tools(cfg, skill);
+    plugin: &PluginSpec,
+) -> Result<Option<PluginToolBridgeSessionHandle>> {
+    let allowed_tools = resolve_allowed_plugin_tools(cfg, plugin);
     if allowed_tools.is_empty() {
         return Ok(None);
     }
 
     let token = maid_core::new_id();
-    let session = SkillToolSession {
+    let session = PluginToolSession {
         version: 1,
-        skill_name: skill.manifest.name.clone(),
+        plugin_name: plugin.manifest.name.clone(),
         token: token.clone(),
         allowed_tools,
-        max_calls_per_minute: cfg.skill_tool_max_calls_per_minute(),
+        max_calls_per_minute: cfg.plugin_tool_max_calls_per_minute(),
         issued_at: Utc::now().to_rfc3339(),
         expires_at: (Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
     };
 
     let path = std::env::temp_dir().join(format!(
-        "maid-skill-tool-session-{}-{}.json",
-        skill.manifest.name,
+        "maid-plugin-tool-session-{}-{}.json",
+        plugin.manifest.name,
         maid_core::new_id()
     ));
-    let raw = serde_json::to_vec(&session).context("failed to serialize skill tool session")?;
+    let raw = serde_json::to_vec(&session).context("failed to serialize plugin tool session")?;
     std::fs::write(&path, raw)
-        .with_context(|| format!("failed to write skill tool session {}", path.display()))?;
+        .with_context(|| format!("failed to write plugin tool session {}", path.display()))?;
 
-    Ok(Some(SkillToolBridgeSessionHandle { path, token }))
+    Ok(Some(PluginToolBridgeSessionHandle { path, token }))
 }
 
-fn resolve_allowed_skill_tools(cfg: &AppConfig, skill: &SkillSpec) -> Vec<String> {
-    let cfg_allow = cfg.skill_tool_allowlist();
+fn resolve_allowed_plugin_tools(cfg: &AppConfig, plugin: &PluginSpec) -> Vec<String> {
+    let cfg_allow = cfg.plugin_tool_allowlist();
     if cfg_allow.is_empty() {
         return Vec::new();
     }
-    let skill_allow = skill.manifest.allowed_tools.clone().unwrap_or_default();
-    if skill_allow.is_empty() {
+    let plugin_allow = plugin.manifest.allowed_tools.clone().unwrap_or_default();
+    if plugin_allow.is_empty() {
         return Vec::new();
     }
 
-    skill_allow
+    plugin_allow
         .into_iter()
         .filter(|tool| cfg_allow.contains(tool))
-        .filter(|tool| is_supported_skill_tool(tool))
+        .filter(|tool| is_supported_plugin_tool(tool))
         .collect()
 }
 
@@ -1771,7 +2083,7 @@ async fn handle_tool_command(
     service: Arc<AppService>,
     command: ToolCommands,
 ) -> Result<()> {
-    let session = load_skill_tool_session_from_env_optional()?;
+    let session = load_plugin_tool_session_from_env_optional()?;
 
     match command {
         ToolCommands::List => {
@@ -1795,31 +2107,31 @@ async fn handle_tool_command(
             let parsed = parse_kv_args(&args)?;
             if let Some(session) = session {
                 if !session.allowed_tools.iter().any(|allowed| allowed == &tool) {
-                    return Err(anyhow!("tool '{}' not allowed for skill session", tool));
+                    return Err(anyhow!("tool '{}' not allowed for plugin session", tool));
                 }
                 let recent_count = service
                     .store
-                    .count_recent_skill_tool_calls(
-                        &session.skill_name,
+                    .count_recent_plugin_tool_calls(
+                        &session.plugin_name,
                         Utc::now() - chrono::Duration::minutes(1),
                     )
                     .await?;
                 if recent_count >= i64::from(session.max_calls_per_minute) {
                     return Err(anyhow!(
-                        "skill tool rate limit exceeded for '{}' (max {} calls/min)",
-                        session.skill_name,
+                        "plugin tool rate limit exceeded for '{}' (max {} calls/min)",
+                        session.plugin_name,
                         session.max_calls_per_minute
                     ));
                 }
-                let skill_actor = format!("skill:{}", session.skill_name);
+                let plugin_actor = format!("plugin:{}", session.plugin_name);
                 let outcome =
-                    execute_tool_call(cfg, service.clone(), &tool, parsed, &skill_actor).await;
+                    execute_tool_call(cfg, service.clone(), &tool, parsed, &plugin_actor).await;
                 let (result_status, data) = match outcome {
                     Ok(data) => ("SUCCESS", data),
                     Err(err) => {
-                        audit_skill_tool_call(
+                        audit_plugin_tool_call(
                             service.clone(),
-                            &session.skill_name,
+                            &session.plugin_name,
                             &tool,
                             "FAILED",
                             Some(json!({ "error": format!("{err:#}") })),
@@ -1829,9 +2141,9 @@ async fn handle_tool_command(
                     }
                 };
 
-                audit_skill_tool_call(
+                audit_plugin_tool_call(
                     service.clone(),
-                    &session.skill_name,
+                    &session.plugin_name,
                     &tool,
                     result_status,
                     Some(json!({ "data_preview": data })),
@@ -1897,39 +2209,39 @@ async fn handle_audit_command(service: Arc<AppService>, command: AuditCommands) 
     Ok(())
 }
 
-fn load_skill_tool_session_from_env_optional() -> Result<Option<SkillToolSession>> {
-    let session_path = std::env::var("MAID_SKILL_TOOL_SESSION").ok();
-    let provided_token = std::env::var("MAID_SKILL_TOOL_TOKEN").ok();
+fn load_plugin_tool_session_from_env_optional() -> Result<Option<PluginToolSession>> {
+    let session_path = std::env::var("MAID_PLUGIN_TOOL_SESSION").ok();
+    let provided_token = std::env::var("MAID_PLUGIN_TOOL_TOKEN").ok();
     let (session_path, provided_token) = match (session_path, provided_token) {
         (None, None) => return Ok(None),
         (Some(_), None) | (None, Some(_)) => {
             return Err(anyhow!(
-                "incomplete tool bridge env: both MAID_SKILL_TOOL_SESSION and MAID_SKILL_TOOL_TOKEN are required"
+                "incomplete tool bridge env: both MAID_PLUGIN_TOOL_SESSION and MAID_PLUGIN_TOOL_TOKEN are required"
             ));
         }
         (Some(session_path), Some(provided_token)) => (session_path, provided_token),
     };
 
     let raw = std::fs::read_to_string(&session_path)
-        .with_context(|| format!("failed to read skill tool session {}", session_path))?;
-    let session: SkillToolSession =
-        serde_json::from_str(&raw).context("invalid skill tool session payload")?;
+        .with_context(|| format!("failed to read plugin tool session {}", session_path))?;
+    let session: PluginToolSession =
+        serde_json::from_str(&raw).context("invalid plugin tool session payload")?;
 
     if session.version != 1 {
-        return Err(anyhow!("unsupported skill tool session version"));
+        return Err(anyhow!("unsupported plugin tool session version"));
     }
     if session.max_calls_per_minute == 0 {
-        return Err(anyhow!("invalid skill tool session rate limit"));
+        return Err(anyhow!("invalid plugin tool session rate limit"));
     }
     if session.token != provided_token {
-        return Err(anyhow!("invalid skill tool session token"));
+        return Err(anyhow!("invalid plugin tool session token"));
     }
 
     let expires_at = DateTime::parse_from_rfc3339(&session.expires_at)
         .context("invalid session expiration timestamp")?
         .with_timezone(&Utc);
     if Utc::now() > expires_at {
-        return Err(anyhow!("skill tool session expired"));
+        return Err(anyhow!("plugin tool session expired"));
     }
 
     Ok(Some(session))
@@ -2410,6 +2722,140 @@ async fn execute_grep_tool(
     }))
 }
 
+async fn auto_invoke_skills_for_prompt(
+    cfg: &AppConfig,
+    service: Arc<AppService>,
+    group_name: &str,
+    actor: &str,
+) -> Result<Option<String>> {
+    let mut rows = Vec::new();
+    for skill in cfg.enabled_skills().into_iter().take(8) {
+        if !is_supported_context_skill(&skill) {
+            let error = format!("unsupported skill '{}'", skill);
+            audit_auto_skill_context_call(
+                service.clone(),
+                actor,
+                &skill,
+                "SKIPPED",
+                Some(json!({ "error": error })),
+            )
+            .await;
+            rows.push(json!({
+                "skill": skill,
+                "status": "SKIPPED",
+                "error": error,
+            }));
+            continue;
+        }
+
+        match execute_context_skill(cfg, service.clone(), group_name, &skill).await {
+            Ok(payload) => {
+                audit_auto_skill_context_call(
+                    service.clone(),
+                    actor,
+                    &skill,
+                    "SUCCESS",
+                    Some(json!({ "preview": tool_result_preview(&payload, 600) })),
+                )
+                .await;
+                rows.push(json!({
+                    "skill": skill,
+                    "status": "SUCCESS",
+                    "context": payload,
+                }));
+            }
+            Err(err) => {
+                let err_text = format!("{err:#}");
+                audit_auto_skill_context_call(
+                    service.clone(),
+                    actor,
+                    &skill,
+                    "FAILED",
+                    Some(json!({ "error": err_text })),
+                )
+                .await;
+                rows.push(json!({
+                    "skill": skill,
+                    "status": "FAILED",
+                    "error": err_text,
+                }));
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut rendered = serde_json::to_string_pretty(&json!({ "skills": rows }))?;
+    rendered = truncate_line(&rendered, cfg.skill_max_context_chars());
+    Ok(Some(rendered))
+}
+
+async fn execute_context_skill(
+    cfg: &AppConfig,
+    service: Arc<AppService>,
+    group_name: &str,
+    skill_name: &str,
+) -> Result<serde_json::Value> {
+    let group = service
+        .store
+        .get_group_by_name(group_name)
+        .await?
+        .ok_or_else(|| anyhow!("group not found: {group_name}"))?;
+
+    match skill_name {
+        "memory.recent" => {
+            let rows = service
+                .store
+                .list_recent_messages(&group.id, cfg.skill_recent_message_limit())
+                .await?;
+            let messages = rows
+                .into_iter()
+                .map(|row| {
+                    json!({
+                        "role": row.role.as_str(),
+                        "content": truncate_line(&row.content, 300),
+                        "created_at": row.created_at.to_rfc3339(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "group": group.name,
+                "message_count": messages.len(),
+                "messages": messages,
+            }))
+        }
+        "tasks.snapshot" => {
+            let tasks = service.list_tasks(&group.name).await?;
+            let items = tasks
+                .into_iter()
+                .take(cfg.skill_task_limit())
+                .map(|task| {
+                    json!({
+                        "id": task.id,
+                        "name": task.name,
+                        "status": task.status.as_str(),
+                        "schedule": task.schedule_rrule,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "group": group.name,
+                "task_count": items.len(),
+                "tasks": items,
+            }))
+        }
+        "group.profile" => Ok(json!({
+            "id": group.id,
+            "name": group.name,
+            "root_path": group.root_path,
+            "created_at": group.created_at.to_rfc3339(),
+        })),
+        _ => Err(anyhow!("unsupported context skill '{}'", skill_name)),
+    }
+}
+
 async fn auto_route_tools_for_prompt(
     cfg: &AppConfig,
     service: Arc<AppService>,
@@ -2420,7 +2866,7 @@ async fn auto_route_tools_for_prompt(
     let allowed = cfg
         .tool_auto_router_allowlist()
         .into_iter()
-        .filter(|name| is_supported_skill_tool(name))
+        .filter(|name| is_supported_plugin_tool(name))
         .filter(|name| name != "run.prompt")
         .collect::<Vec<_>>();
     if allowed.is_empty() {
@@ -2733,9 +3179,9 @@ fn required_arg<'a>(args: &'a BTreeMap<String, String>, key: &str) -> Result<&'a
         .ok_or_else(|| anyhow!("missing required argument: {}", key))
 }
 
-async fn audit_skill_tool_call(
+async fn audit_plugin_tool_call(
     service: Arc<AppService>,
-    skill_name: &str,
+    plugin_name: &str,
     tool: &str,
     result: &str,
     metadata_json: Option<serde_json::Value>,
@@ -2744,12 +3190,12 @@ async fn audit_skill_tool_call(
         .store
         .insert_audit(NewAudit {
             group_id: None,
-            action: "SKILL_TOOL_CALL".to_string(),
-            actor: format!("skill:{skill_name}"),
+            action: "PLUGIN_TOOL_CALL".to_string(),
+            actor: format!("plugin:{plugin_name}"),
             result: result.to_string(),
             created_at: Utc::now(),
             metadata_json: Some(json!({
-                "skill": skill_name,
+                "plugin": plugin_name,
                 "tool": tool,
                 "metadata": metadata_json,
             })),
@@ -2802,6 +3248,33 @@ async fn audit_auto_router_tool_call(
         .await;
 }
 
+async fn audit_auto_skill_context_call(
+    service: Arc<AppService>,
+    actor: &str,
+    skill: &str,
+    result: &str,
+    metadata_json: Option<serde_json::Value>,
+) {
+    let _ = service
+        .store
+        .insert_audit(NewAudit {
+            group_id: None,
+            action: "AUTO_SKILL_CONTEXT".to_string(),
+            actor: actor.to_string(),
+            result: result.to_string(),
+            created_at: Utc::now(),
+            metadata_json: Some(json!({
+                "skill": skill,
+                "metadata": metadata_json,
+            })),
+        })
+        .await;
+}
+
+fn is_supported_context_skill(name: &str) -> bool {
+    matches!(name, "memory.recent" | "tasks.snapshot" | "group.profile")
+}
+
 fn supported_tool_names() -> &'static [&'static str] {
     &[
         "group.list",
@@ -2821,7 +3294,7 @@ fn supported_tool_names() -> &'static [&'static str] {
     ]
 }
 
-fn is_supported_skill_tool(name: &str) -> bool {
+fn is_supported_plugin_tool(name: &str) -> bool {
     supported_tool_names().contains(&name)
 }
 
@@ -2845,68 +3318,68 @@ fn tool_summary(name: &str) -> Option<&'static str> {
     }
 }
 
-fn resolve_skills_dir(cfg: &AppConfig, override_dir: Option<PathBuf>) -> PathBuf {
-    override_dir.unwrap_or_else(|| PathBuf::from(cfg.skill_directory()))
+fn resolve_plugins_dir(cfg: &AppConfig, override_dir: Option<PathBuf>) -> PathBuf {
+    override_dir.unwrap_or_else(|| PathBuf::from(cfg.plugin_directory()))
 }
 
-fn ensure_skill_enabled(cfg: &AppConfig, name: &str) -> Result<()> {
-    if cfg.is_skill_enabled(name) {
+fn ensure_plugin_enabled(cfg: &AppConfig, name: &str) -> Result<()> {
+    if cfg.is_plugin_enabled(name) {
         return Ok(());
     }
     Err(anyhow!(
-        "skill '{}' is disabled by config.skills.enabled",
+        "plugin '{}' is disabled by config.plugins.enabled",
         name
     ))
 }
 
-fn validate_skills_for_startup(cfg: &AppConfig) -> Result<()> {
-    if !cfg.validate_skills_on_startup() {
+fn validate_plugins_for_startup(cfg: &AppConfig) -> Result<()> {
+    if !cfg.validate_plugins_on_startup() {
         return Ok(());
     }
 
-    let skills_dir = PathBuf::from(cfg.skill_directory());
-    if let Some(enabled) = cfg.enabled_skills() {
+    let plugins_dir = PathBuf::from(cfg.plugin_directory());
+    if let Some(enabled) = cfg.enabled_plugins() {
         info!(
-            "validating {} enabled skill(s) from {}",
+            "validating {} enabled plugin(s) from {}",
             enabled.len(),
-            skills_dir.display()
+            plugins_dir.display()
         );
         for name in enabled {
-            let skill = load_skill(&skills_dir, name).with_context(|| {
+            let plugin = load_plugin(&plugins_dir, name).with_context(|| {
                 format!(
-                    "startup skill validation failed for '{}' in {}",
+                    "startup plugin validation failed for '{}' in {}",
                     name,
-                    skills_dir.display()
+                    plugins_dir.display()
                 )
             })?;
-            enforce_skill_signature_policy(cfg, &skill, false)?;
+            enforce_plugin_signature_policy(cfg, &plugin, false)?;
         }
         return Ok(());
     }
 
-    let skills = discover_skills(&skills_dir)?;
-    for skill in &skills {
-        enforce_skill_signature_policy(cfg, skill, false)?;
+    let plugins = discover_plugins(&plugins_dir)?;
+    for plugin in &plugins {
+        enforce_plugin_signature_policy(cfg, plugin, false)?;
     }
     info!(
-        "validated {} skill(s) from {}",
-        skills.len(),
-        skills_dir.display()
+        "validated {} plugin(s) from {}",
+        plugins.len(),
+        plugins_dir.display()
     );
     Ok(())
 }
 
-fn enforce_skill_signature_policy(
+fn enforce_plugin_signature_policy(
     cfg: &AppConfig,
-    skill: &SkillSpec,
+    plugin: &PluginSpec,
     force_require: bool,
 ) -> Result<()> {
-    let trusted = cfg.skill_trusted_signing_keys();
-    let require_signature = force_require || cfg.skill_require_signatures();
+    let trusted = cfg.plugin_trusted_signing_keys();
+    let require_signature = force_require || cfg.plugin_require_signatures();
     if trusted.is_empty() && !require_signature {
         return Ok(());
     }
-    verify_skill_signature(skill, &trusted, require_signature)
+    verify_plugin_signature(plugin, &trusted, require_signature)
 }
 
 fn parent_or_current(path: &str) -> Result<&Path> {
@@ -3261,18 +3734,18 @@ async fn handle_dashboard_client(
             let body = serde_json::to_string_pretty(&groups)?;
             write_http_response(&mut write_half, "200 OK", "application/json", body).await?;
         }
-        ("GET", "/api/skills") => {
+        ("GET", "/api/plugins") => {
             let live_cfg = AppConfig::load(&config_path).unwrap_or(cfg.clone());
-            let skills_dir = PathBuf::from(live_cfg.skill_directory());
-            let skills = discover_skills(&skills_dir)?;
-            let payload = skills
+            let plugins_dir = PathBuf::from(live_cfg.plugin_directory());
+            let plugins = discover_plugins(&plugins_dir)?;
+            let payload = plugins
                 .into_iter()
-                .map(|skill| {
+                .map(|plugin| {
                     json!({
-                        "name": skill.manifest.name,
-                        "version": skill.manifest.version,
-                        "enabled": live_cfg.is_skill_enabled(&skill.manifest.name),
-                        "description": skill.manifest.description,
+                        "name": plugin.manifest.name,
+                        "version": plugin.manifest.version,
+                        "enabled": live_cfg.is_plugin_enabled(&plugin.manifest.name),
+                        "description": plugin.manifest.description,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -3350,26 +3823,26 @@ async fn handle_dashboard_client(
             }))?;
             write_http_response(&mut write_half, "200 OK", "application/json", body).await?;
         }
-        ("POST", "/api/skills/enable") => {
+        ("POST", "/api/plugins/enable") => {
             let name = query
                 .get("name")
                 .cloned()
                 .ok_or_else(|| anyhow!("missing query param: name"))?;
-            validate_skill_name(&name)?;
-            set_skill_enabled_in_config(&config_path, &name, true)?;
+            validate_plugin_name(&name)?;
+            set_plugin_enabled_in_config(&config_path, &name, true)?;
             let body = serde_json::to_string_pretty(&json!({
                 "name": name,
                 "enabled": true
             }))?;
             write_http_response(&mut write_half, "200 OK", "application/json", body).await?;
         }
-        ("POST", "/api/skills/disable") => {
+        ("POST", "/api/plugins/disable") => {
             let name = query
                 .get("name")
                 .cloned()
                 .ok_or_else(|| anyhow!("missing query param: name"))?;
-            validate_skill_name(&name)?;
-            set_skill_enabled_in_config(&config_path, &name, false)?;
+            validate_plugin_name(&name)?;
+            set_plugin_enabled_in_config(&config_path, &name, false)?;
             let body = serde_json::to_string_pretty(&json!({
                 "name": name,
                 "enabled": false
@@ -3694,8 +4167,8 @@ async fn run_onboard(cfg: &AppConfig, config_path: &Path) -> Result<()> {
         .with_context(|| format!("failed to create db parent for {}", cfg.database_path))?;
     std::fs::create_dir_all(&cfg.group_root)
         .with_context(|| format!("failed to create group root {}", cfg.group_root))?;
-    std::fs::create_dir_all(cfg.skill_directory())
-        .with_context(|| format!("failed to create skills dir {}", cfg.skill_directory()))?;
+    std::fs::create_dir_all(cfg.plugin_directory())
+        .with_context(|| format!("failed to create plugins dir {}", cfg.plugin_directory()))?;
 
     let store = SqliteStore::connect(&cfg.database_path).await?;
     let migration_dir = config_path
@@ -3739,7 +4212,8 @@ async fn run_onboard(cfg: &AppConfig, config_path: &Path) -> Result<()> {
     println!("config: {}", config_path.display());
     println!("database: {}", cfg.database_path);
     println!("group_root: {}", cfg.group_root);
-    println!("skills: {}", cfg.skill_directory());
+    println!("plugins: {}", cfg.plugin_directory());
+    println!("skills: {}", cfg.enabled_skills().join(", "));
     println!("default_group: main");
     println!(
         "model_auth: {}",
@@ -3777,15 +4251,19 @@ async fn run_onboard(cfg: &AppConfig, config_path: &Path) -> Result<()> {
 async fn run_doctor(cfg: &AppConfig, config_path: &Path) -> Result<()> {
     let mut failed = 0_u32;
 
-    fn report(ok: bool, label: &str, detail: &str) {
-        if ok {
-            println!("[ok]   {label}: {detail}");
-        } else {
-            println!("[fail] {label}: {detail}");
-        }
+    fn report_ok(label: &str, detail: &str) {
+        println!("[ok]   {label}: {detail}");
     }
 
-    report(true, "config", &format!("loaded {}", config_path.display()));
+    fn report_warn(label: &str, detail: &str) {
+        println!("[warn] {label}: {detail}");
+    }
+
+    fn report_fail(label: &str, detail: &str) {
+        println!("[fail] {label}: {detail}");
+    }
+
+    report_ok("config", &format!("loaded {}", config_path.display()));
 
     let db_ok = match SqliteStore::connect(&cfg.database_path).await {
         Ok(store) => {
@@ -3802,8 +4280,10 @@ async fn run_doctor(cfg: &AppConfig, config_path: &Path) -> Result<()> {
     };
     if !db_ok {
         failed += 1;
+        report_fail("database", &cfg.database_path);
+    } else {
+        report_ok("database", &cfg.database_path);
     }
-    report(db_ok, "database", &cfg.database_path);
 
     let runtime_binary = if cfg.runtime == "apple_container" {
         "container"
@@ -3815,10 +4295,11 @@ async fn run_doctor(cfg: &AppConfig, config_path: &Path) -> Result<()> {
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false);
-    if !runtime_ok {
-        failed += 1;
+    if runtime_ok {
+        report_ok("runtime", runtime_binary);
+    } else {
+        report_warn("runtime", &format!("{runtime_binary} not found on PATH"));
     }
-    report(runtime_ok, "runtime", runtime_binary);
 
     let model_provider = cfg.model_provider_name();
     let model_ok = if model_provider == "openai" {
@@ -3831,29 +4312,34 @@ async fn run_doctor(cfg: &AppConfig, config_path: &Path) -> Result<()> {
     } else {
         true
     };
-    if !model_ok {
-        failed += 1;
+    if model_ok {
+        report_ok("model_auth", &model_provider);
+    } else {
+        report_warn("model_auth", &format!("{model_provider} credentials missing"));
     }
-    report(model_ok, "model_auth", &model_provider);
 
     if let Some(telegram) = &cfg.telegram {
         let telegram_ok = std::env::var(&telegram.bot_token_env)
             .ok()
             .filter(|v| !v.trim().is_empty())
             .is_some();
-        if !telegram_ok {
-            failed += 1;
+        if telegram_ok {
+            report_ok("telegram_token", &telegram.bot_token_env);
+        } else {
+            report_warn("telegram_token", &format!("{} missing", telegram.bot_token_env));
         }
-        report(telegram_ok, "telegram_token", &telegram.bot_token_env);
     } else {
-        report(true, "telegram", "disabled");
+        report_ok("telegram", "disabled");
     }
 
-    let skill_ok = validate_skills_for_startup(cfg).is_ok();
-    if !skill_ok {
+    let plugin_ok = validate_plugins_for_startup(cfg).is_ok();
+    if !plugin_ok {
         failed += 1;
+        report_fail("plugins", cfg.plugin_directory());
+    } else {
+        report_ok("plugins", cfg.plugin_directory());
     }
-    report(skill_ok, "skills", cfg.skill_directory());
+    report_ok("skills", &cfg.enabled_skills().join(", "));
 
     if failed > 0 {
         return Err(anyhow!("doctor found {} failing check(s)", failed));
@@ -3906,15 +4392,21 @@ mention_token = "@maid"
 # per_chat_mention_token = { "123456789" = "@maid" }
 
 [skills]
-directory = "skills"
+enabled = ["memory.recent", "tasks.snapshot", "group.profile"]
+# max_context_chars = 4000
+# recent_message_limit = 8
+# task_limit = 12
+
+[plugins]
+directory = "plugins"
 enabled = ["echo"]
 # allow_unlisted = false
 # tool_allowlist = ["group.list", "group.create", "run.prompt", "task.list", "task.create", "task.run_now", "task.pause", "task.resume", "task.delete", "task.clear_group", "task.clear_all", "ops.web_fetch", "ops.search", "ops.grep"]
 # tool_max_calls_per_minute = 60
 validate_on_startup = true
-# [skills.registry]
-# index_path = "skills/registry.toml"
-# [skills.signing]
+# [plugins.registry]
+# index_path = "plugins/registry.toml"
+# [plugins.signing]
 # require_signatures = false
 # trusted_keys = { "local.dev" = "keys/local-dev.public.pem" }
 
@@ -4003,14 +4495,14 @@ mod tests {
     #[test]
     fn select_registry_entry_chooses_latest() {
         let entries = vec![
-            SkillRegistryEntry {
+            PluginRegistryEntry {
                 name: "echo".to_string(),
                 version: "0.1.0".to_string(),
                 description: None,
                 source: "/tmp/echo-0.1.0".to_string(),
                 subdir: None,
             },
-            SkillRegistryEntry {
+            PluginRegistryEntry {
                 name: "echo".to_string(),
                 version: "0.2.0".to_string(),
                 description: None,
@@ -4041,6 +4533,22 @@ mod tests {
             parsed.calls[1].args.get("ignore_case").map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn parse_subagent_plan_extracts_steps() {
+        let raw = r#"{
+            "rationale":"split work",
+            "final_instruction":"compose final answer",
+            "steps":[
+                {"name":"research","prompt":"Gather facts"},
+                {"name":"draft","prompt":"Draft response"}
+            ]
+        }"#;
+        let parsed = parse_subagent_plan(raw).unwrap();
+        assert_eq!(parsed.steps.len(), 2);
+        assert_eq!(parsed.steps[0].name, "research");
+        assert_eq!(parsed.steps[1].prompt, "Draft response");
     }
 
     #[test]

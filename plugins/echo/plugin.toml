@@ -1,8 +1,8 @@
 name = "echo"
 version = "0.1.0"
-description = "Simple reference skill that echoes command and args"
+description = "Simple Rust reference plugin that echoes command and args"
 executable = "./run.sh"
 capabilities = ["echo.run"]
 allowed_tools = []
-timeout_seconds = 10
+timeout_seconds = 60
 env_allowlist = []

@@ -1064,9 +1064,9 @@ dependencies = [
  "maid-channel-telegram",
  "maid-core",
  "maid-model",
+ "maid-plugin-sdk",
  "maid-sandbox",
  "maid-scheduler",
- "maid-skill-sdk",
  "maid-storage",
  "reqwest",
  "serde",
@@ -1119,6 +1119,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "maid-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "maid-sandbox"
 version = "0.1.0"
 dependencies = [
@@ -1140,17 +1151,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "maid-skill-sdk"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tokio",
- "toml",
 ]
 
 [[package]]

@@ -54,37 +54,37 @@ fn run_maid(config_path: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn skill_can_call_core_tools_through_secure_bridge() {
-    let root = unique_temp_dir("maid-skill-bridge-it");
+fn plugin_can_call_core_tools_through_secure_bridge() {
+    let root = unique_temp_dir("maid-plugin-bridge-it");
     fs::create_dir_all(&root).expect("failed to create temp root");
 
     let config_path = root.join("config.toml");
     let db_path = root.join("data/assistant.db");
     let group_root = root.join("groups");
-    let skill_root = root.join("skills/bridge");
+    let plugin_root = root.join("plugins/bridge");
 
     copy_migrations(&root);
-    fs::create_dir_all(&skill_root).expect("failed to create skill dir");
+    fs::create_dir_all(&plugin_root).expect("failed to create plugin dir");
 
-    let skill_manifest = r#"
+    let plugin_manifest = r#"
 name = "bridge"
 version = "0.1.0"
-description = "bridge integration skill"
+description = "bridge integration plugin"
 executable = "./run.sh"
 capabilities = ["bridge.run"]
 allowed_tools = ["group.create"]
 timeout_seconds = 30
 env_allowlist = []
 "#;
-    write_file(&skill_root.join("skill.toml"), skill_manifest.trim_start());
+    write_file(&plugin_root.join("plugin.toml"), plugin_manifest.trim_start());
 
-    let skill_script = r#"#!/usr/bin/env bash
+    let plugin_script = r#"#!/usr/bin/env bash
 set -euo pipefail
 "${MAID_BIN:-maid}" tool call --tool group.create --arg name=bridge-int-group >/dev/null
-printf '%s\n' '{"ok":true,"message":"bridge skill done","output":"group.create invoked","data":null}'
+printf '%s\n' '{"ok":true,"message":"bridge plugin done","output":"group.create invoked","data":null}'
 "#;
-    let script_path = skill_root.join("run.sh");
-    write_file(&script_path, skill_script);
+    let script_path = plugin_root.join("run.sh");
+    write_file(&script_path, plugin_script);
     #[cfg(unix)]
     make_executable(&script_path);
 
@@ -102,7 +102,7 @@ api_key_env = "OPENAI_API_KEY"
 tick_seconds = 30
 max_concurrency = 2
 
-[skills]
+[plugins]
 directory = "{}"
 enabled = ["bridge"]
 tool_allowlist = ["group.create"]
@@ -111,23 +111,23 @@ validate_on_startup = true
 "#,
         db_path.display(),
         group_root.display(),
-        root.join("skills").display()
+        root.join("plugins").display()
     );
     write_file(&config_path, &config);
 
-    let skill_run = run_maid(
+    let plugin_run = run_maid(
         &config_path,
-        &["skill", "run", "--name", "bridge", "--command", "sync"],
+        &["plugin", "run", "--name", "bridge", "--command", "sync"],
     );
     assert!(
-        skill_run.status.success(),
-        "skill run failed: {}",
-        String::from_utf8_lossy(&skill_run.stderr)
+        plugin_run.status.success(),
+        "plugin run failed: {}",
+        String::from_utf8_lossy(&plugin_run.stderr)
     );
-    let stdout = String::from_utf8_lossy(&skill_run.stdout);
+    let stdout = String::from_utf8_lossy(&plugin_run.stdout);
     assert!(
-        stdout.contains("bridge skill done"),
-        "unexpected skill output: {stdout}"
+        stdout.contains("bridge plugin done"),
+        "unexpected plugin output: {stdout}"
     );
 
     let groups = run_maid(&config_path, &["group", "list"]);

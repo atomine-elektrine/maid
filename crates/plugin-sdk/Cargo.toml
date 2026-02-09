@@ -1,5 +1,5 @@
 [package]
-name = "maid-skill-sdk"
+name = "maid-plugin-sdk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

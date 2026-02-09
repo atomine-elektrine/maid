@@ -38,16 +38,16 @@ impl SqliteStore {
         &self.pool
     }
 
-    pub async fn count_recent_skill_tool_calls(
+    pub async fn count_recent_plugin_tool_calls(
         &self,
-        skill_name: &str,
+        plugin_name: &str,
         since: DateTime<Utc>,
     ) -> Result<i64> {
-        let actor = format!("skill:{skill_name}");
+        let actor = format!("plugin:{plugin_name}");
         let row = sqlx::query(
             "SELECT COUNT(*) as count \
              FROM audits \
-             WHERE action = 'SKILL_TOOL_CALL' AND actor = ? AND created_at >= ?",
+             WHERE action = 'PLUGIN_TOOL_CALL' AND actor = ? AND created_at >= ?",
         )
         .bind(actor)
         .bind(since.to_rfc3339())
@@ -848,7 +848,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
 
         let count = store
-            .count_recent_skill_tool_calls("unit", Utc::now() - chrono::Duration::minutes(1))
+            .count_recent_plugin_tool_calls("unit", Utc::now() - chrono::Duration::minutes(1))
             .await
             .unwrap();
         assert_eq!(count, 0);

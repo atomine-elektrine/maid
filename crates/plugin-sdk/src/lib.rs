@@ -12,7 +12,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SkillManifest {
+pub struct PluginManifest {
     pub name: String,
     pub version: String,
     pub description: Option<String>,
@@ -26,43 +26,43 @@ pub struct SkillManifest {
 }
 
 #[derive(Debug, Clone)]
-pub struct SkillSpec {
+pub struct PluginSpec {
     pub root_dir: PathBuf,
     pub manifest_path: PathBuf,
     pub executable_path: PathBuf,
-    pub manifest: SkillManifest,
+    pub manifest: PluginManifest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillRequest {
+pub struct PluginRequest {
     pub command: String,
     pub args: BTreeMap<String, String>,
     pub input: Option<String>,
-    pub context: SkillContext,
+    pub context: PluginContext,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillContext {
+pub struct PluginContext {
     pub actor: String,
     pub cwd: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillResponse {
+pub struct PluginResponse {
     pub ok: bool,
     pub message: String,
     pub output: Option<String>,
     pub data: Option<Value>,
 }
 
-pub fn discover_skills(skills_dir: &Path) -> Result<Vec<SkillSpec>> {
-    if !skills_dir.exists() {
+pub fn discover_plugins(plugins_dir: &Path) -> Result<Vec<PluginSpec>> {
+    if !plugins_dir.exists() {
         return Ok(Vec::new());
     }
 
     let mut specs = Vec::new();
-    for entry in std::fs::read_dir(skills_dir)
-        .with_context(|| format!("failed to read skills directory {}", skills_dir.display()))?
+    for entry in std::fs::read_dir(plugins_dir)
+        .with_context(|| format!("failed to read plugins directory {}", plugins_dir.display()))?
     {
         let entry = entry?;
         let entry_path = entry.path();
@@ -70,21 +70,21 @@ pub fn discover_skills(skills_dir: &Path) -> Result<Vec<SkillSpec>> {
             continue;
         }
 
-        let manifest_path = entry_path.join("skill.toml");
+        let manifest_path = entry_path.join("plugin.toml");
         if !manifest_path.exists() {
             continue;
         }
 
-        specs.push(load_skill_spec(&entry_path)?);
+        specs.push(load_plugin_spec(&entry_path)?);
     }
 
     specs.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
     Ok(specs)
 }
 
-pub fn load_skill(skills_dir: &Path, name: &str) -> Result<SkillSpec> {
-    let skill_dir = skills_dir.join(name);
-    load_skill_spec(&skill_dir)
+pub fn load_plugin(plugins_dir: &Path, name: &str) -> Result<PluginSpec> {
+    let plugin_dir = plugins_dir.join(name);
+    load_plugin_spec(&plugin_dir)
 }
 
 pub fn parse_kv_args(args: &[String]) -> Result<BTreeMap<String, String>> {
@@ -101,15 +101,15 @@ pub fn parse_kv_args(args: &[String]) -> Result<BTreeMap<String, String>> {
     Ok(map)
 }
 
-pub async fn run_skill(spec: &SkillSpec, request: SkillRequest) -> Result<SkillResponse> {
-    run_skill_with_env(spec, request, &[]).await
+pub async fn run_plugin(spec: &PluginSpec, request: PluginRequest) -> Result<PluginResponse> {
+    run_plugin_with_env(spec, request, &[]).await
 }
 
-pub async fn run_skill_with_env(
-    spec: &SkillSpec,
-    request: SkillRequest,
+pub async fn run_plugin_with_env(
+    spec: &PluginSpec,
+    request: PluginRequest,
     extra_env: &[(String, String)],
-) -> Result<SkillResponse> {
+) -> Result<PluginResponse> {
     let timeout_secs = spec.manifest.timeout_seconds.unwrap_or(30).clamp(1, 600);
 
     let mut command = Command::new(&spec.executable_path);
@@ -130,8 +130,8 @@ pub async fn run_skill_with_env(
     }
 
     let request_json =
-        serde_json::to_string(&request).context("failed to serialize skill request")?;
-    command.env("MAID_SKILL_REQUEST", request_json);
+        serde_json::to_string(&request).context("failed to serialize plugin request")?;
+    command.env("MAID_PLUGIN_REQUEST", request_json);
 
     for (key, value) in extra_env {
         command.env(key, value);
@@ -145,20 +145,20 @@ pub async fn run_skill_with_env(
 
     let child = command.spawn().with_context(|| {
         format!(
-            "failed to spawn skill executable {}",
+            "failed to spawn plugin executable {}",
             spec.executable_path.display()
         )
     })?;
 
     let output = timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
         .await
-        .map_err(|_| anyhow!("skill execution timed out after {timeout_secs}s"))?
-        .context("skill process wait failed")?;
+        .map_err(|_| anyhow!("plugin execution timed out after {timeout_secs}s"))?
+        .context("plugin process wait failed")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(anyhow!(
-            "skill exited with status {}: {}",
+            "plugin exited with status {}: {}",
             output.status,
             stderr.trim()
         ));
@@ -167,17 +167,17 @@ pub async fn run_skill_with_env(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let payload = stdout.trim();
     if payload.is_empty() {
-        return Err(anyhow!("skill returned empty stdout payload"));
+        return Err(anyhow!("plugin returned empty stdout payload"));
     }
 
-    let response = serde_json::from_str::<SkillResponse>(payload)
-        .with_context(|| format!("invalid skill response JSON: {payload}"))?;
+    let response = serde_json::from_str::<PluginResponse>(payload)
+        .with_context(|| format!("invalid plugin response JSON: {payload}"))?;
 
     Ok(response)
 }
 
 pub fn generate_ed25519_keypair_pem() -> Result<(String, String)> {
-    let tmp_dir = unique_temp_dir("maid-skill-keygen");
+    let tmp_dir = unique_temp_dir("maid-plugin-keygen");
     fs::create_dir_all(&tmp_dir)
         .with_context(|| format!("failed to create temp dir {}", tmp_dir.display()))?;
     let private_path = tmp_dir.join("private.pem");
@@ -214,11 +214,11 @@ pub fn generate_ed25519_keypair_pem() -> Result<(String, String)> {
     Ok((private_pem, public_pem))
 }
 
-pub fn sign_skill(spec: &SkillSpec, key_id: &str, private_key_path: &Path) -> Result<String> {
+pub fn sign_plugin(spec: &PluginSpec, key_id: &str, private_key_path: &Path) -> Result<String> {
     validate_key_id(key_id)?;
-    let payload = skill_signature_payload(spec, key_id)?;
-    let payload_path = write_temp_file("maid-skill-sign-payload", &payload)?;
-    let signature_path = unique_temp_file("maid-skill-signature");
+    let payload = plugin_signature_payload(spec, key_id)?;
+    let payload_path = write_temp_file("maid-plugin-sign-payload", &payload)?;
+    let signature_path = unique_temp_file("maid-plugin-signature");
     run_openssl(&[
         "pkeyutl",
         "-sign",
@@ -243,15 +243,15 @@ pub fn sign_skill(spec: &SkillSpec, key_id: &str, private_key_path: &Path) -> Re
     Ok(hex_encode(&signature))
 }
 
-pub fn verify_skill_signature(
-    spec: &SkillSpec,
+pub fn verify_plugin_signature(
+    spec: &PluginSpec,
     trusted_public_keys: &BTreeMap<String, String>,
     require_signature: bool,
 ) -> Result<()> {
     let Some(key_id) = spec.manifest.signing_key_id.as_deref() else {
         if require_signature {
             return Err(anyhow!(
-                "skill '{}' is missing signing_key_id/signature",
+                "plugin '{}' is missing signing_key_id/signature",
                 spec.manifest.name
             ));
         }
@@ -260,7 +260,7 @@ pub fn verify_skill_signature(
     let Some(signature_b64) = spec.manifest.signature.as_deref() else {
         if require_signature {
             return Err(anyhow!(
-                "skill '{}' is missing signing_key_id/signature",
+                "plugin '{}' is missing signing_key_id/signature",
                 spec.manifest.name
             ));
         }
@@ -269,15 +269,15 @@ pub fn verify_skill_signature(
 
     let trusted_key = trusted_public_keys.get(key_id).ok_or_else(|| {
         anyhow!(
-            "skill '{}' uses unknown signing key id '{}'",
+            "plugin '{}' uses unknown signing key id '{}'",
             spec.manifest.name,
             key_id
         )
     })?;
     let signature = hex_decode(signature_b64)?;
-    let payload = skill_signature_payload(spec, key_id)?;
-    let payload_path = write_temp_file("maid-skill-verify-payload", &payload)?;
-    let sig_path = write_temp_file("maid-skill-verify-signature", &signature)?;
+    let payload = plugin_signature_payload(spec, key_id)?;
+    let payload_path = write_temp_file("maid-plugin-verify-payload", &payload)?;
+    let sig_path = write_temp_file("maid-plugin-verify-signature", &signature)?;
     let verified = run_openssl_checked(&[
         "pkeyutl",
         "-verify",
@@ -299,26 +299,26 @@ pub fn verify_skill_signature(
     fs::remove_file(sig_path).ok();
     if !verified {
         return Err(anyhow!(
-            "skill '{}' has invalid signature",
+            "plugin '{}' has invalid signature",
             spec.manifest.name
         ));
     }
     Ok(())
 }
 
-pub fn write_skill_signature(manifest_path: &Path, key_id: &str, signature: &str) -> Result<()> {
+pub fn write_plugin_signature(manifest_path: &Path, key_id: &str, signature: &str) -> Result<()> {
     validate_key_id(key_id)?;
     if signature.trim().is_empty() {
         return Err(anyhow!("signature must not be empty"));
     }
 
     let raw = std::fs::read_to_string(manifest_path)
-        .with_context(|| format!("failed to read skill manifest {}", manifest_path.display()))?;
+        .with_context(|| format!("failed to read plugin manifest {}", manifest_path.display()))?;
     let mut value: toml::Value = toml::from_str(&raw)
-        .with_context(|| format!("failed to parse skill manifest {}", manifest_path.display()))?;
+        .with_context(|| format!("failed to parse plugin manifest {}", manifest_path.display()))?;
     let table = value
         .as_table_mut()
-        .ok_or_else(|| anyhow!("skill manifest must be a TOML table"))?;
+        .ok_or_else(|| anyhow!("plugin manifest must be a TOML table"))?;
     table.insert(
         "signing_key_id".to_string(),
         toml::Value::String(key_id.to_string()),
@@ -329,38 +329,38 @@ pub fn write_skill_signature(manifest_path: &Path, key_id: &str, signature: &str
     );
     let formatted = toml::to_string_pretty(&value).with_context(|| {
         format!(
-            "failed to serialize skill manifest {}",
+            "failed to serialize plugin manifest {}",
             manifest_path.display()
         )
     })?;
     std::fs::write(manifest_path, formatted)
-        .with_context(|| format!("failed to write skill manifest {}", manifest_path.display()))?;
+        .with_context(|| format!("failed to write plugin manifest {}", manifest_path.display()))?;
     Ok(())
 }
 
-fn load_skill_spec(skill_dir: &Path) -> Result<SkillSpec> {
-    if !skill_dir.exists() {
+fn load_plugin_spec(plugin_dir: &Path) -> Result<PluginSpec> {
+    if !plugin_dir.exists() {
         return Err(anyhow!(
-            "skill directory not found: {}",
-            skill_dir.display()
+            "plugin directory not found: {}",
+            plugin_dir.display()
         ));
     }
 
-    let root_dir = skill_dir
+    let root_dir = plugin_dir
         .canonicalize()
-        .with_context(|| format!("failed to resolve skill directory {}", skill_dir.display()))?;
-    let manifest_path = root_dir.join("skill.toml");
+        .with_context(|| format!("failed to resolve plugin directory {}", plugin_dir.display()))?;
+    let manifest_path = root_dir.join("plugin.toml");
 
     let raw = std::fs::read_to_string(&manifest_path)
-        .with_context(|| format!("failed to read skill manifest {}", manifest_path.display()))?;
-    let manifest = toml::from_str::<SkillManifest>(&raw)
-        .with_context(|| format!("failed to parse skill manifest {}", manifest_path.display()))?;
+        .with_context(|| format!("failed to read plugin manifest {}", manifest_path.display()))?;
+    let manifest = toml::from_str::<PluginManifest>(&raw)
+        .with_context(|| format!("failed to parse plugin manifest {}", manifest_path.display()))?;
 
     validate_manifest(&manifest)?;
 
     let executable_rel = Path::new(&manifest.executable);
     if executable_rel.is_absolute() {
-        return Err(anyhow!("skill executable must be a relative path"));
+        return Err(anyhow!("plugin executable must be a relative path"));
     }
 
     let executable_path = root_dir.join(executable_rel);
@@ -372,11 +372,11 @@ fn load_skill_spec(skill_dir: &Path) -> Result<SkillSpec> {
     })?;
 
     if !executable_path.starts_with(&root_dir) {
-        return Err(anyhow!("skill executable path escapes skill directory"));
+        return Err(anyhow!("plugin executable path escapes plugin directory"));
     }
 
     if !executable_path.is_file() {
-        return Err(anyhow!("skill executable is not a file"));
+        return Err(anyhow!("plugin executable is not a file"));
     }
 
     if manifest.name
@@ -386,7 +386,7 @@ fn load_skill_spec(skill_dir: &Path) -> Result<SkillSpec> {
             .unwrap_or_default()
     {
         return Err(anyhow!(
-            "skill name '{}' must match directory name '{}'",
+            "plugin name '{}' must match directory name '{}'",
             manifest.name,
             root_dir
                 .file_name()
@@ -395,7 +395,7 @@ fn load_skill_spec(skill_dir: &Path) -> Result<SkillSpec> {
         ));
     }
 
-    Ok(SkillSpec {
+    Ok(PluginSpec {
         root_dir,
         manifest_path,
         executable_path,
@@ -403,9 +403,9 @@ fn load_skill_spec(skill_dir: &Path) -> Result<SkillSpec> {
     })
 }
 
-fn validate_manifest(manifest: &SkillManifest) -> Result<()> {
+fn validate_manifest(manifest: &PluginManifest) -> Result<()> {
     if manifest.name.trim().is_empty() {
-        return Err(anyhow!("skill name must not be empty"));
+        return Err(anyhow!("plugin name must not be empty"));
     }
     if !manifest
         .name
@@ -413,14 +413,14 @@ fn validate_manifest(manifest: &SkillManifest) -> Result<()> {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         return Err(anyhow!(
-            "skill name must contain only lowercase letters, digits, and hyphens"
+            "plugin name must contain only lowercase letters, digits, and hyphens"
         ));
     }
     if manifest.version.trim().is_empty() {
-        return Err(anyhow!("skill version must not be empty"));
+        return Err(anyhow!("plugin version must not be empty"));
     }
     if manifest.executable.trim().is_empty() {
-        return Err(anyhow!("skill executable must not be empty"));
+        return Err(anyhow!("plugin executable must not be empty"));
     }
     for tool in manifest.allowed_tools.clone().unwrap_or_default() {
         validate_tool_name(&tool)?;
@@ -432,13 +432,13 @@ fn validate_manifest(manifest: &SkillManifest) -> Result<()> {
         (Some(key_id), Some(signature)) => {
             validate_key_id(key_id)?;
             if signature.trim().is_empty() {
-                return Err(anyhow!("skill signature must not be empty"));
+                return Err(anyhow!("plugin signature must not be empty"));
             }
         }
         (None, None) => {}
         _ => {
             return Err(anyhow!(
-                "skill signing fields must include both signing_key_id and signature"
+                "plugin signing fields must include both signing_key_id and signature"
             ));
         }
     }
@@ -479,20 +479,20 @@ fn validate_key_id(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn skill_signature_payload(spec: &SkillSpec, key_id: &str) -> Result<Vec<u8>> {
+fn plugin_signature_payload(spec: &PluginSpec, key_id: &str) -> Result<Vec<u8>> {
     let capabilities = normalized_list(spec.manifest.capabilities.as_ref());
     let allowed_tools = normalized_list(spec.manifest.allowed_tools.as_ref());
     let env_allowlist = normalized_list(spec.manifest.env_allowlist.as_ref());
     let executable_bytes = std::fs::read(&spec.executable_path).with_context(|| {
         format!(
-            "failed to read skill executable {}",
+            "failed to read plugin executable {}",
             spec.executable_path.display()
         )
     })?;
     let executable_fingerprint = hex_encode(&executable_bytes);
 
     let payload = format!(
-        "maid-skill-signature-v1\nname={}\nversion={}\nkey_id={}\nexecutable={}\ntimeout_seconds={}\ncapabilities={}\nallowed_tools={}\nenv_allowlist={}\nexecutable_hex={}\n",
+        "maid-plugin-signature-v1\nname={}\nversion={}\nkey_id={}\nexecutable={}\ntimeout_seconds={}\ncapabilities={}\nallowed_tools={}\nenv_allowlist={}\nexecutable_hex={}\n",
         spec.manifest.name,
         spec.manifest.version,
         key_id,
@@ -623,16 +623,16 @@ mod tests {
     }
 
     #[test]
-    fn skill_signature_roundtrip() {
-        let sandbox = unique_temp_dir("maid-skill-sdk-signature");
+    fn plugin_signature_roundtrip() {
+        let sandbox = unique_temp_dir("maid-plugin-sdk-signature");
         let root = sandbox.join("signed");
         fs::create_dir_all(&root).expect("failed to create temp dir");
         fs::write(
-            root.join("skill.toml"),
+            root.join("plugin.toml"),
             r#"
 name = "signed"
 version = "0.1.0"
-description = "signed skill"
+description = "signed plugin"
 executable = "./run.sh"
 capabilities = ["bridge.run"]
 allowed_tools = ["group.list"]
@@ -641,9 +641,9 @@ env_allowlist = []
 "#
             .trim_start(),
         )
-        .expect("failed to write skill manifest");
+        .expect("failed to write plugin manifest");
         fs::write(root.join("run.sh"), "#!/usr/bin/env bash\necho ok\n")
-            .expect("failed to write skill executable");
+            .expect("failed to write plugin executable");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -654,7 +654,7 @@ env_allowlist = []
             fs::set_permissions(root.join("run.sh"), perms).expect("failed to chmod run.sh");
         }
 
-        let spec = load_skill_spec(&root).expect("failed to load skill spec");
+        let spec = load_plugin_spec(&root).expect("failed to load plugin spec");
         let (private_key, public_key) =
             generate_ed25519_keypair_pem().expect("failed to generate keypair");
         let private_key_path = sandbox.join("private.pem");
@@ -662,17 +662,17 @@ env_allowlist = []
         fs::write(&private_key_path, private_key).expect("failed to write private key");
         fs::write(&public_key_path, public_key).expect("failed to write public key");
 
-        let signature = sign_skill(&spec, "local.dev", &private_key_path).expect("failed to sign");
-        write_skill_signature(&spec.manifest_path, "local.dev", &signature)
+        let signature = sign_plugin(&spec, "local.dev", &private_key_path).expect("failed to sign");
+        write_plugin_signature(&spec.manifest_path, "local.dev", &signature)
             .expect("failed to write signature");
 
-        let signed_spec = load_skill_spec(&root).expect("failed to reload signed skill");
+        let signed_spec = load_plugin_spec(&root).expect("failed to reload signed plugin");
         let mut trusted = BTreeMap::new();
         trusted.insert(
             "local.dev".to_string(),
             public_key_path.display().to_string(),
         );
-        verify_skill_signature(&signed_spec, &trusted, true).expect("failed to verify");
+        verify_plugin_signature(&signed_spec, &trusted, true).expect("failed to verify");
 
         fs::remove_dir_all(sandbox).ok();
     }

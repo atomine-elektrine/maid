@@ -3,7 +3,7 @@ members = [
   "apps/maidd",
   "crates/channel-telegram",
   "crates/core",
-  "crates/skill-sdk",
+  "crates/plugin-sdk",
   "crates/storage",
   "crates/model",
   "crates/sandbox",

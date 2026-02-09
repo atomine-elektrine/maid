@@ -13,6 +13,7 @@ pub struct AppConfig {
     pub scheduler: SchedulerConfig,
     pub telegram: Option<TelegramConfig>,
     pub skills: Option<SkillsConfig>,
+    pub plugins: Option<PluginsConfig>,
     pub tools: Option<ToolsConfig>,
     pub policy: Option<PolicyConfig>,
     pub security: Option<SecurityConfig>,
@@ -70,25 +71,33 @@ pub struct TelegramConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SkillsConfig {
+pub struct PluginsConfig {
     pub directory: Option<String>,
     pub enabled: Option<Vec<String>>,
     pub allow_unlisted: Option<bool>,
     pub tool_allowlist: Option<Vec<String>>,
     pub tool_max_calls_per_minute: Option<u32>,
     pub validate_on_startup: Option<bool>,
-    pub signing: Option<SkillSigningConfig>,
-    pub registry: Option<SkillRegistryConfig>,
+    pub signing: Option<PluginSigningConfig>,
+    pub registry: Option<PluginRegistryConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SkillSigningConfig {
+pub struct SkillsConfig {
+    pub enabled: Option<Vec<String>>,
+    pub max_context_chars: Option<usize>,
+    pub recent_message_limit: Option<i64>,
+    pub task_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginSigningConfig {
     pub require_signatures: Option<bool>,
     pub trusted_keys: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SkillRegistryConfig {
+pub struct PluginRegistryConfig {
     pub index_path: Option<String>,
 }
 
@@ -275,55 +284,55 @@ impl AppConfig {
                 }
             }
         }
-        if let Some(skills) = &self.skills {
-            if let Some(directory) = &skills.directory {
+        if let Some(plugins) = &self.plugins {
+            if let Some(directory) = &plugins.directory {
                 if directory.trim().is_empty() {
-                    return Err(anyhow!("skills.directory must not be empty when set"));
+                    return Err(anyhow!("plugins.directory must not be empty when set"));
                 }
             }
-            if let Some(enabled) = &skills.enabled {
+            if let Some(enabled) = &plugins.enabled {
                 let mut seen = std::collections::HashSet::new();
                 for name in enabled {
-                    validate_skill_name(name)?;
+                    validate_plugin_name(name)?;
                     if !seen.insert(name) {
                         return Err(anyhow!(
-                            "skills.enabled contains duplicate skill name: {name}"
+                            "plugins.enabled contains duplicate plugin name: {name}"
                         ));
                     }
                 }
             }
-            if let Some(tool_allowlist) = &skills.tool_allowlist {
+            if let Some(tool_allowlist) = &plugins.tool_allowlist {
                 let mut seen = std::collections::HashSet::new();
                 for tool in tool_allowlist {
                     validate_tool_name(tool)?;
                     if !seen.insert(tool) {
                         return Err(anyhow!(
-                            "skills.tool_allowlist contains duplicate tool name: {tool}"
+                            "plugins.tool_allowlist contains duplicate tool name: {tool}"
                         ));
                     }
                 }
             }
-            if let Some(max_calls) = skills.tool_max_calls_per_minute {
+            if let Some(max_calls) = plugins.tool_max_calls_per_minute {
                 if max_calls == 0 {
                     return Err(anyhow!(
-                        "skills.tool_max_calls_per_minute must be greater than zero when set"
+                        "plugins.tool_max_calls_per_minute must be greater than zero when set"
                     ));
                 }
             }
-            if let Some(registry) = &skills.registry {
+            if let Some(registry) = &plugins.registry {
                 if let Some(index_path) = &registry.index_path {
                     if index_path.trim().is_empty() {
-                        return Err(anyhow!("skills.registry.index_path must not be empty"));
+                        return Err(anyhow!("plugins.registry.index_path must not be empty"));
                     }
                 }
             }
-            if let Some(signing) = &skills.signing {
+            if let Some(signing) = &plugins.signing {
                 if let Some(keys) = &signing.trusted_keys {
                     for (key_id, public_key) in keys {
                         validate_signing_key_id(key_id)?;
                         if public_key.trim().is_empty() {
                             return Err(anyhow!(
-                                "skills.signing.trusted_keys values must not be empty"
+                                "plugins.signing.trusted_keys values must not be empty"
                             ));
                         }
                     }
@@ -336,7 +345,41 @@ impl AppConfig {
                         .unwrap_or(true)
                 {
                     return Err(anyhow!(
-                        "skills.signing.require_signatures=true requires skills.signing.trusted_keys"
+                        "plugins.signing.require_signatures=true requires plugins.signing.trusted_keys"
+                    ));
+                }
+            }
+        }
+        if let Some(skills) = &self.skills {
+            if let Some(enabled) = &skills.enabled {
+                let mut seen = std::collections::HashSet::new();
+                for name in enabled {
+                    validate_skill_name(name)?;
+                    if !seen.insert(name) {
+                        return Err(anyhow!(
+                            "skills.enabled contains duplicate skill name: {name}"
+                        ));
+                    }
+                }
+            }
+            if let Some(max_chars) = skills.max_context_chars {
+                if max_chars == 0 || max_chars > 20_000 {
+                    return Err(anyhow!(
+                        "skills.max_context_chars must be between 1 and 20000 when set"
+                    ));
+                }
+            }
+            if let Some(limit) = skills.recent_message_limit {
+                if limit == 0 || limit > 50 {
+                    return Err(anyhow!(
+                        "skills.recent_message_limit must be between 1 and 50 when set"
+                    ));
+                }
+            }
+            if let Some(limit) = skills.task_limit {
+                if limit == 0 || limit > 100 {
+                    return Err(anyhow!(
+                        "skills.task_limit must be between 1 and 100 when set"
                     ));
                 }
             }
@@ -421,96 +464,130 @@ impl AppConfig {
         }
 
         if self.is_production() {
-            if self.enabled_skills().is_none() && !self.allow_unlisted_skills() {
+            if self.enabled_plugins().is_none() && !self.allow_unlisted_plugins() {
                 return Err(anyhow!(
-                    "production mode requires skills.enabled allowlist (or skills.allow_unlisted=true)"
+                    "production mode requires plugins.enabled allowlist (or plugins.allow_unlisted=true)"
                 ));
             }
-            if !self.skill_require_signatures() {
+            if !self.plugin_require_signatures() {
                 return Err(anyhow!(
-                    "production mode requires skills.signing.require_signatures=true"
+                    "production mode requires plugins.signing.require_signatures=true"
                 ));
             }
         }
         Ok(())
     }
 
-    pub fn skill_directory(&self) -> &str {
+    pub fn enabled_skills(&self) -> Vec<String> {
         self.skills
             .as_ref()
-            .and_then(|skills| skills.directory.as_deref())
-            .unwrap_or("skills")
+            .and_then(|skills| skills.enabled.clone())
+            .unwrap_or_else(|| {
+                vec![
+                    "memory.recent".to_string(),
+                    "tasks.snapshot".to_string(),
+                    "group.profile".to_string(),
+                ]
+            })
     }
 
-    pub fn enabled_skills(&self) -> Option<&[String]> {
+    pub fn skill_max_context_chars(&self) -> usize {
         self.skills
             .as_ref()
-            .and_then(|skills| skills.enabled.as_deref())
+            .and_then(|skills| skills.max_context_chars)
+            .unwrap_or(4000)
     }
 
-    pub fn allow_unlisted_skills(&self) -> bool {
+    pub fn skill_recent_message_limit(&self) -> i64 {
         self.skills
             .as_ref()
-            .and_then(|skills| skills.allow_unlisted)
+            .and_then(|skills| skills.recent_message_limit)
+            .unwrap_or(8)
+    }
+
+    pub fn skill_task_limit(&self) -> usize {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.task_limit)
+            .unwrap_or(12)
+    }
+
+    pub fn plugin_directory(&self) -> &str {
+        self.plugins
+            .as_ref()
+            .and_then(|plugins| plugins.directory.as_deref())
+            .unwrap_or("plugins")
+    }
+
+    pub fn enabled_plugins(&self) -> Option<&[String]> {
+        self.plugins
+            .as_ref()
+            .and_then(|plugins| plugins.enabled.as_deref())
+    }
+
+    pub fn allow_unlisted_plugins(&self) -> bool {
+        self.plugins
+            .as_ref()
+            .and_then(|plugins| plugins.allow_unlisted)
             .unwrap_or(false)
     }
 
-    pub fn is_skill_enabled(&self, name: &str) -> bool {
-        match self.enabled_skills() {
+    pub fn is_plugin_enabled(&self, name: &str) -> bool {
+        match self.enabled_plugins() {
             Some(enabled) => enabled.iter().any(|candidate| candidate == name),
-            None => self.allow_unlisted_skills(),
+            None => self.allow_unlisted_plugins(),
         }
     }
 
-    pub fn validate_skills_on_startup(&self) -> bool {
-        self.skills
+    pub fn validate_plugins_on_startup(&self) -> bool {
+        self.plugins
             .as_ref()
-            .and_then(|skills| skills.validate_on_startup)
+            .and_then(|plugins| plugins.validate_on_startup)
             .unwrap_or_else(|| {
-                self.skills
+                self.plugins
                     .as_ref()
-                    .and_then(|skills| skills.enabled.as_ref())
+                    .and_then(|plugins| plugins.enabled.as_ref())
                     .is_some()
             })
     }
 
-    pub fn skill_tool_allowlist(&self) -> Vec<String> {
-        self.skills
+    pub fn plugin_tool_allowlist(&self) -> Vec<String> {
+        self.plugins
             .as_ref()
-            .and_then(|skills| skills.tool_allowlist.clone())
+            .and_then(|plugins| plugins.tool_allowlist.clone())
             .unwrap_or_default()
     }
 
-    pub fn skill_tool_max_calls_per_minute(&self) -> u32 {
-        self.skills
+    pub fn plugin_tool_max_calls_per_minute(&self) -> u32 {
+        self.plugins
             .as_ref()
-            .and_then(|skills| skills.tool_max_calls_per_minute)
+            .and_then(|plugins| plugins.tool_max_calls_per_minute)
             .unwrap_or(60)
     }
 
-    pub fn skill_registry_index_path(&self) -> String {
-        self.skills
+    pub fn plugin_registry_index_path(&self) -> String {
+        self.plugins
             .as_ref()
-            .and_then(|skills| skills.registry.as_ref())
+            .and_then(|plugins| plugins.registry.as_ref())
             .and_then(|registry| registry.index_path.clone())
-            .unwrap_or_else(|| "skills/registry.toml".to_string())
+            .unwrap_or_else(|| "plugins/registry.toml".to_string())
     }
 
-    pub fn skill_require_signatures(&self) -> bool {
+    pub fn plugin_require_signatures(&self) -> bool {
         if self.is_production() {
             return true;
         }
-        self.skills
+        self.plugins
             .as_ref()
-            .and_then(|skills| skills.signing.as_ref())
+            .and_then(|plugins| plugins.signing.as_ref())
             .and_then(|signing| signing.require_signatures)
             .unwrap_or(false)
     }
 
-    pub fn skill_trusted_signing_keys(&self) -> BTreeMap<String, String> {
-        self.skills
+    pub fn plugin_trusted_signing_keys(&self) -> BTreeMap<String, String> {
+        self.plugins
             .as_ref()
-            .and_then(|skills| skills.signing.as_ref())
+            .and_then(|plugins| plugins.signing.as_ref())
             .and_then(|signing| signing.trusted_keys.clone())
             .unwrap_or_default()
     }
@@ -803,16 +880,31 @@ fn parse_chat_map_string(map: Option<BTreeMap<String, String>>) -> BTreeMap<i64,
     out
 }
 
-fn validate_skill_name(name: &str) -> Result<()> {
+fn validate_plugin_name(name: &str) -> Result<()> {
     if name.trim().is_empty() {
-        return Err(anyhow!("skill name must not be empty"));
+        return Err(anyhow!("plugin name must not be empty"));
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         return Err(anyhow!(
-            "skill name must contain only lowercase letters, digits, and hyphens"
+            "plugin name must contain only lowercase letters, digits, and hyphens"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_skill_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(anyhow!("skill name must not be empty"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
+    {
+        return Err(anyhow!(
+            "skill name must contain only lowercase letters, digits, dots, and hyphens"
         ));
     }
     Ok(())
@@ -882,13 +974,19 @@ mod tests {
         mention_token = "@maid"
 
         [skills]
-        directory = "skills"
+        enabled = ["memory.recent", "tasks.snapshot"]
+        max_context_chars = 3000
+        recent_message_limit = 6
+        task_limit = 10
+
+        [plugins]
+        directory = "plugins"
         enabled = ["echo"]
         tool_allowlist = ["group.list", "task.list", "task.create"]
         tool_max_calls_per_minute = 30
         validate_on_startup = true
 
-        [skills.signing]
+        [plugins.signing]
         require_signatures = false
         trusted_keys = { "local.dev" = "BASE64_PUBLIC_KEY" }
 
@@ -907,22 +1005,32 @@ mod tests {
 
         let parsed: AppConfig = toml::from_str(raw).unwrap();
         parsed.validate().unwrap();
-        assert!(parsed.is_skill_enabled("echo"));
-        assert!(!parsed.is_skill_enabled("not-enabled"));
-        assert_eq!(parsed.skill_directory(), "skills");
-        assert!(parsed.validate_skills_on_startup());
+        assert!(parsed.is_plugin_enabled("echo"));
+        assert!(!parsed.is_plugin_enabled("not-enabled"));
+        assert_eq!(parsed.plugin_directory(), "plugins");
+        assert!(parsed.validate_plugins_on_startup());
         assert_eq!(
-            parsed.skill_tool_allowlist(),
+            parsed.plugin_tool_allowlist(),
             vec!["group.list", "task.list", "task.create"]
         );
-        assert_eq!(parsed.skill_tool_max_calls_per_minute(), 30);
-        assert!(!parsed.skill_require_signatures());
-        assert_eq!(parsed.skill_trusted_signing_keys().len(), 1);
+        assert_eq!(parsed.plugin_tool_max_calls_per_minute(), 30);
+        assert!(!parsed.plugin_require_signatures());
+        assert_eq!(parsed.plugin_trusted_signing_keys().len(), 1);
         assert_eq!(parsed.model_api_key_envs().len(), 2);
         assert_eq!(parsed.model_candidates().len(), 2);
         assert_eq!(parsed.telegram_dm_policy(), "pairing");
         assert_eq!(parsed.telegram_activation_mode(), "mention");
         assert_eq!(parsed.telegram_mention_token(), Some("@maid"));
+        assert_eq!(
+            parsed.enabled_skills(),
+            vec![
+                "memory.recent".to_string(),
+                "tasks.snapshot".to_string()
+            ]
+        );
+        assert_eq!(parsed.skill_max_context_chars(), 3000);
+        assert_eq!(parsed.skill_recent_message_limit(), 6);
+        assert_eq!(parsed.skill_task_limit(), 10);
         assert!(!parsed.policy_allow_job_tasks_default());
         assert_eq!(parsed.policy_allow_job_task_groups(), vec!["ops"]);
         assert_eq!(parsed.tool_web_fetch_timeout_seconds(), 20);
@@ -1005,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_invalid_skill_name() {
+    fn reject_invalid_plugin_name() {
         let raw = r#"
         database_path = "data/assistant.db"
         group_root = "groups"
@@ -1019,7 +1127,7 @@ mod tests {
         tick_seconds = 30
         max_concurrency = 2
 
-        [skills]
+        [plugins]
         enabled = ["BadName"]
         "#;
 
@@ -1028,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_invalid_tool_name_in_skill_allowlist() {
+    fn reject_invalid_tool_name_in_plugin_allowlist() {
         let raw = r#"
         database_path = "data/assistant.db"
         group_root = "groups"
@@ -1042,7 +1150,7 @@ mod tests {
         tick_seconds = 30
         max_concurrency = 2
 
-        [skills]
+        [plugins]
         tool_allowlist = ["BadTool"]
         "#;
 
@@ -1051,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_invalid_skill_tool_rate_limit() {
+    fn reject_invalid_plugin_tool_rate_limit() {
         let raw = r#"
         database_path = "data/assistant.db"
         group_root = "groups"
@@ -1065,7 +1173,7 @@ mod tests {
         tick_seconds = 30
         max_concurrency = 2
 
-        [skills]
+        [plugins]
         tool_max_calls_per_minute = 0
         "#;
 
@@ -1098,7 +1206,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_default_to_disabled_without_allowlist() {
+    fn plugins_default_to_disabled_without_allowlist() {
         let raw = r#"
         database_path = "data/assistant.db"
         group_root = "groups"
@@ -1115,25 +1223,36 @@ mod tests {
 
         let parsed: AppConfig = toml::from_str(raw).unwrap();
         parsed.validate().unwrap();
-        assert!(!parsed.is_skill_enabled("anything"));
-        assert!(!parsed.validate_skills_on_startup());
-        assert_eq!(parsed.skill_directory(), "skills");
+        assert!(!parsed.is_plugin_enabled("anything"));
+        assert!(!parsed.validate_plugins_on_startup());
+        assert_eq!(parsed.plugin_directory(), "plugins");
         assert_eq!(parsed.telegram_dm_policy(), "open");
         assert_eq!(parsed.telegram_activation_mode(), "always");
         assert_eq!(parsed.model_candidates(), vec!["gpt-4.1-mini"]);
-        assert_eq!(parsed.skill_tool_max_calls_per_minute(), 60);
-        assert!(!parsed.skill_require_signatures());
-        assert!(parsed.skill_trusted_signing_keys().is_empty());
+        assert_eq!(parsed.plugin_tool_max_calls_per_minute(), 60);
+        assert!(!parsed.plugin_require_signatures());
+        assert!(parsed.plugin_trusted_signing_keys().is_empty());
         assert_eq!(parsed.tool_web_fetch_timeout_seconds(), 15);
         assert_eq!(parsed.tool_web_fetch_max_bytes(), 131_072);
         assert!(parsed.tool_web_fetch_allowed_domains().is_empty());
         assert_eq!(parsed.tool_grep_max_file_bytes(), 1_048_576);
         assert_eq!(parsed.tool_grep_max_matches(), 100);
         assert_eq!(parsed.tool_search_max_results(), 5);
+        assert_eq!(
+            parsed.enabled_skills(),
+            vec![
+                "memory.recent".to_string(),
+                "tasks.snapshot".to_string(),
+                "group.profile".to_string()
+            ]
+        );
+        assert_eq!(parsed.skill_max_context_chars(), 4000);
+        assert_eq!(parsed.skill_recent_message_limit(), 8);
+        assert_eq!(parsed.skill_task_limit(), 12);
     }
 
     #[test]
-    fn allow_unlisted_skills_enables_default_skill_access() {
+    fn allow_unlisted_plugins_enables_default_plugin_access() {
         let raw = r#"
         database_path = "data/assistant.db"
         group_root = "groups"
@@ -1147,17 +1266,17 @@ mod tests {
         tick_seconds = 30
         max_concurrency = 2
 
-        [skills]
+        [plugins]
         allow_unlisted = true
         "#;
 
         let parsed: AppConfig = toml::from_str(raw).unwrap();
         parsed.validate().unwrap();
-        assert!(parsed.is_skill_enabled("anything"));
+        assert!(parsed.is_plugin_enabled("anything"));
     }
 
     #[test]
-    fn reject_skill_signing_with_missing_keys() {
+    fn reject_plugin_signing_with_missing_keys() {
         let raw = r#"
         database_path = "data/assistant.db"
         group_root = "groups"
@@ -1171,7 +1290,7 @@ mod tests {
         tick_seconds = 30
         max_concurrency = 2
 
-        [skills.signing]
+        [plugins.signing]
         require_signatures = true
         "#;
 
@@ -1194,7 +1313,7 @@ mod tests {
         tick_seconds = 30
         max_concurrency = 2
 
-        [skills.signing]
+        [plugins.signing]
         trusted_keys = { "bad key" = "abc" }
         "#;
 
@@ -1219,6 +1338,29 @@ mod tests {
 
         [tools]
         web_fetch_timeout_seconds = 0
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_skill_config() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [skills]
+        enabled = ["Memory.Recent", "memory.recent"]
         "#;
 
         let parsed: AppConfig = toml::from_str(raw).unwrap();
