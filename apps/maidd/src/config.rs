@@ -784,7 +784,7 @@ impl AppConfig {
         self.tools
             .as_ref()
             .and_then(|tools| tools.auto_router_enabled)
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     pub fn tool_auto_router_allowlist(&self) -> Vec<String> {
@@ -1042,6 +1042,7 @@ mod tests {
         assert_eq!(parsed.tool_grep_max_file_bytes(), 500000);
         assert_eq!(parsed.tool_grep_max_matches(), 50);
         assert_eq!(parsed.tool_search_max_results(), 8);
+        assert!(parsed.tool_auto_router_enabled());
     }
 
     #[test]
@@ -1238,6 +1239,7 @@ mod tests {
         assert_eq!(parsed.tool_grep_max_file_bytes(), 1_048_576);
         assert_eq!(parsed.tool_grep_max_matches(), 100);
         assert_eq!(parsed.tool_search_max_results(), 5);
+        assert!(parsed.tool_auto_router_enabled());
         assert_eq!(
             parsed.enabled_skills(),
             vec![

@@ -2,6 +2,7 @@ mod config;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
@@ -52,6 +53,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Status,
+    Guide,
+    Init {
+        #[arg(long, default_value = "personal")]
+        template: String,
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     Group {
         #[command(subcommand)]
         command: GroupCommands,
@@ -102,7 +110,10 @@ enum Commands {
         #[arg(long, default_value_t = 18789)]
         gateway_port: u16,
     },
-    Onboard,
+    Onboard {
+        #[arg(long, default_value_t = false)]
+        interactive: bool,
+    },
     Doctor,
     Daemon,
     Telegram,
@@ -130,6 +141,16 @@ enum TaskCommands {
         schedule: String,
         #[arg(long)]
         prompt: String,
+    },
+    Wizard {
+        #[arg(long)]
+        group: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        schedule: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
     },
     QuickAdd {
         #[arg(long)]
@@ -636,7 +657,17 @@ struct PluginToolSession {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(err) = run().await {
+        eprintln!("Error: {err:#}");
+        if let Some(hint) = remediation_hint(&err) {
+            eprintln!("Fix: {hint}");
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_target(false)
@@ -644,6 +675,14 @@ async fn main() -> Result<()> {
         .init();
 
     let mut cli = Cli::parse();
+    if matches!(&cli.command, Commands::Guide) {
+        run_guide();
+        return Ok(());
+    }
+    if let Commands::Init { template, force } = &cli.command {
+        run_init_config(&cli.config, template, *force)?;
+        return Ok(());
+    }
     if !cli.config.exists() {
         if let Ok(from_env) = std::env::var("MAID_CONFIG") {
             let from_env_path = PathBuf::from(from_env);
@@ -652,7 +691,8 @@ async fn main() -> Result<()> {
             }
         }
     }
-    if matches!(&cli.command, Commands::Onboard) && !cli.config.exists() {
+    std::env::set_var("MAID_CONFIG", cli.config.display().to_string());
+    if matches!(&cli.command, Commands::Onboard { .. }) && !cli.config.exists() {
         write_default_config(&cli.config)?;
     }
 
@@ -678,8 +718,15 @@ async fn main() -> Result<()> {
             let service = build_service(&cfg, &cli.config, store.clone(), false)?;
             run_status(&cfg, service).await?;
         }
-        Commands::Onboard => {
-            run_onboard(&cfg, &cli.config).await?;
+        Commands::Guide => {
+            unreachable!("handled before config load");
+        }
+        Commands::Init { .. } => {
+            unreachable!("handled before config load");
+        }
+        Commands::Onboard { interactive } => {
+            let service = build_service(&cfg, &cli.config, store.clone(), false)?;
+            run_onboard(&cfg, &cli.config, interactive, Some(service)).await?;
         }
         Commands::Doctor => {
             run_doctor(&cfg, &cli.config).await?;
@@ -704,8 +751,14 @@ async fn main() -> Result<()> {
                 }
                 GroupCommands::List => {
                     let groups = service.list_groups().await?;
-                    for group in groups {
-                        println!("{}\t{}\t{}", group.id, group.name, group.root_path);
+                    if groups.is_empty() {
+                        println!("no groups found");
+                    } else {
+                        println!("{:<36}  {:<20}  ROOT_PATH", "ID", "NAME");
+                        println!("{}", "-".repeat(96));
+                        for group in groups {
+                            println!("{:<36}  {:<20}  {}", group.id, group.name, group.root_path);
+                        }
                     }
                 }
             }
@@ -784,6 +837,14 @@ async fn handle_task_command(service: Arc<AppService>, command: TaskCommands) ->
                 .await?;
             println!("created task '{}' ({})", task.name, task.id);
         }
+        TaskCommands::Wizard {
+            group,
+            name,
+            schedule,
+            prompt,
+        } => {
+            run_task_wizard(service.clone(), group, name, schedule, prompt).await?;
+        }
         TaskCommands::QuickAdd {
             group,
             name,
@@ -808,14 +869,20 @@ async fn handle_task_command(service: Arc<AppService>, command: TaskCommands) ->
         }
         TaskCommands::List { group } => {
             let tasks = service.list_tasks(&group).await?;
-            for task in tasks {
-                println!(
-                    "{}\t{}\t{}\t{}",
-                    task.id,
-                    task.name,
-                    task.status.as_str(),
-                    task.schedule_rrule
-                );
+            if tasks.is_empty() {
+                println!("no tasks found for group '{group}'");
+            } else {
+                println!("{:<36}  {:<24}  {:<8}  SCHEDULE", "ID", "NAME", "STATUS");
+                println!("{}", "-".repeat(112));
+                for task in tasks {
+                    println!(
+                        "{:<36}  {:<24}  {:<8}  {}",
+                        task.id,
+                        truncate_line(&task.name, 24),
+                        task.status.as_str(),
+                        task.schedule_rrule
+                    );
+                }
             }
         }
         TaskCommands::Pause { id } => {
@@ -864,6 +931,195 @@ async fn handle_task_command(service: Arc<AppService>, command: TaskCommands) ->
     Ok(())
 }
 
+async fn run_task_wizard(
+    service: Arc<AppService>,
+    group: Option<String>,
+    name: Option<String>,
+    schedule: Option<String>,
+    prompt: Option<String>,
+) -> Result<()> {
+    if !io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "task wizard requires an interactive terminal (or use --group/--name/--schedule/--prompt)"
+        ));
+    }
+
+    println!("task wizard");
+    println!("You can enter RRULE directly or natural language like: every 15 minutes, every weekday at 9am");
+
+    let group = group
+        .unwrap_or(prompt_with_default("Group", "work")?)
+        .trim()
+        .to_string();
+    let task_name = name
+        .unwrap_or(prompt_with_default("Task name", "morning-brief")?)
+        .trim()
+        .to_string();
+    let schedule_input = schedule
+        .unwrap_or(prompt_with_default("Schedule", "every weekday at 9am")?)
+        .trim()
+        .to_string();
+    let prompt_text = prompt
+        .unwrap_or(prompt_with_default("Prompt", "Give me a concise morning brief.")?)
+        .trim()
+        .to_string();
+
+    if group.is_empty() || task_name.is_empty() || schedule_input.is_empty() || prompt_text.is_empty() {
+        return Err(anyhow!("all wizard values must be non-empty"));
+    }
+
+    let schedule_rrule = schedule_from_human_or_rrule(&schedule_input)
+        .with_context(|| format!("invalid schedule: {}", schedule_input))?;
+    Schedule::parse_rrule(&schedule_rrule)
+        .with_context(|| format!("invalid schedule RRULE: {}", schedule_rrule))?;
+
+    service.ensure_group(&group, "cli").await?;
+    let task = service
+        .create_task(&group, &task_name, &schedule_rrule, &prompt_text, "cli")
+        .await?;
+
+    println!("created task '{}' ({})", task.name, task.id);
+    println!("group: {}", group);
+    println!("schedule: {}", schedule_rrule);
+    println!("prompt: {}", prompt_text);
+    Ok(())
+}
+
+fn prompt_with_default(label: &str, default: &str) -> Result<String> {
+    print!("{label} [{default}]: ");
+    io::stdout().flush().context("failed to flush stdout")?;
+    let mut raw = String::new();
+    io::stdin()
+        .read_line(&mut raw)
+        .context("failed to read input")?;
+    let value = raw.trim();
+    if value.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn schedule_from_human_or_rrule(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("schedule must not be empty"));
+    }
+    if trimmed.to_ascii_uppercase().starts_with("FREQ=") {
+        return Ok(trimmed.to_string());
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "hourly" || lower == "every hour" {
+        return Ok("FREQ=HOURLY;INTERVAL=1".to_string());
+    }
+    if let Some(minutes) = parse_interval_phrase(&lower, "minute") {
+        return Ok(format!("FREQ=MINUTELY;INTERVAL={minutes}"));
+    }
+    if let Some(hours) = parse_interval_phrase(&lower, "hour") {
+        return Ok(format!("FREQ=HOURLY;INTERVAL={hours}"));
+    }
+    if let Some(time) = lower.strip_prefix("every weekday at ") {
+        let (hour, minute) = parse_time_of_day(time)?;
+        return Ok(format!(
+            "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR={hour};BYMINUTE={minute}"
+        ));
+    }
+    if let Some(time) = lower.strip_prefix("weekdays at ") {
+        let (hour, minute) = parse_time_of_day(time)?;
+        return Ok(format!(
+            "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR={hour};BYMINUTE={minute}"
+        ));
+    }
+    if let Some(time) = lower.strip_prefix("every day at ") {
+        let (hour, minute) = parse_time_of_day(time)?;
+        return Ok(format!(
+            "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR={hour};BYMINUTE={minute}"
+        ));
+    }
+    if let Some(time) = lower.strip_prefix("daily at ") {
+        let (hour, minute) = parse_time_of_day(time)?;
+        return Ok(format!(
+            "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR,SA,SU;BYHOUR={hour};BYMINUTE={minute}"
+        ));
+    }
+
+    Err(anyhow!(
+        "unsupported schedule phrase. Use RRULE or phrases like 'every 15 minutes', 'every hour', 'every weekday at 9am'"
+    ))
+}
+
+fn parse_interval_phrase(lower: &str, unit: &str) -> Option<u64> {
+    let plural = format!("{unit}s");
+    let patterns = [
+        format!("every 1 {unit}"),
+        format!("every 1 {plural}"),
+        format!("every {unit}"),
+        format!("every {plural}"),
+    ];
+    if patterns.iter().any(|pattern| lower == pattern) {
+        return Some(1);
+    }
+    for suffix in [format!(" {unit}"), format!(" {plural}")] {
+        if let Some(raw) = lower.strip_prefix("every ").and_then(|rest| rest.strip_suffix(&suffix))
+        {
+            if let Ok(value) = raw.trim().parse::<u64>() {
+                if value > 0 {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_time_of_day(raw: &str) -> Result<(u32, u32)> {
+    let compact = raw.trim().to_ascii_lowercase().replace(' ', "");
+    if compact.is_empty() {
+        return Err(anyhow!("missing time of day"));
+    }
+
+    let (base, is_pm, has_meridiem) = if let Some(value) = compact.strip_suffix("am") {
+        (value, false, true)
+    } else if let Some(value) = compact.strip_suffix("pm") {
+        (value, true, true)
+    } else {
+        (compact.as_str(), false, false)
+    };
+
+    let (hour_raw, minute_raw) = if let Some((h, m)) = base.split_once(':') {
+        (h, m)
+    } else {
+        (base, "0")
+    };
+
+    let mut hour = hour_raw
+        .parse::<u32>()
+        .map_err(|_| anyhow!("invalid hour in time '{}'", raw))?;
+    let minute = minute_raw
+        .parse::<u32>()
+        .map_err(|_| anyhow!("invalid minute in time '{}'", raw))?;
+    if minute > 59 {
+        return Err(anyhow!("minute must be between 0 and 59"));
+    }
+
+    if has_meridiem {
+        if hour == 0 || hour > 12 {
+            return Err(anyhow!("hour with am/pm must be between 1 and 12"));
+        }
+        if is_pm && hour < 12 {
+            hour += 12;
+        }
+        if !is_pm && hour == 12 {
+            hour = 0;
+        }
+    } else if hour > 23 {
+        return Err(anyhow!("hour must be between 0 and 23"));
+    }
+
+    Ok((hour, minute))
+}
+
 async fn run_status(cfg: &AppConfig, service: Arc<AppService>) -> Result<()> {
     let groups = service.list_groups().await?;
     let mut tasks_total = 0_usize;
@@ -886,17 +1142,54 @@ async fn run_status(cfg: &AppConfig, service: Arc<AppService>) -> Result<()> {
         .iter()
         .filter(|plugin| cfg.is_plugin_enabled(&plugin.manifest.name))
         .count();
+    let enabled_plugin_names = plugins
+        .iter()
+        .filter(|plugin| cfg.is_plugin_enabled(&plugin.manifest.name))
+        .map(|plugin| plugin.manifest.name.clone())
+        .collect::<Vec<_>>();
+    let pending_pairings = service.list_pending_telegram_pairings().await?.len();
 
     println!("runtime: {}", cfg.runtime);
+    println!("model_provider: {}", cfg.model_provider_name());
+    println!("model_candidates: {}", cfg.model_candidates().join(", "));
+    println!(
+        "scheduler: tick={}s max_concurrency={}",
+        cfg.scheduler.tick_seconds, cfg.scheduler.max_concurrency
+    );
+    println!(
+        "telegram: {} (dm_policy={}, activation={})",
+        if cfg.telegram.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        cfg.telegram_dm_policy(),
+        cfg.telegram_activation_mode()
+    );
+    println!(
+        "tools_auto_router: {}",
+        if cfg.tool_auto_router_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     println!("groups: {}", groups.len());
-    println!("tasks_total: {}", tasks_total);
-    println!("tasks_active: {}", tasks_active);
-    println!("tasks_paused: {}", tasks_paused);
+    println!("pending_pairings: {}", pending_pairings);
+    println!("tasks: total={} active={} paused={}", tasks_total, tasks_active, tasks_paused);
     println!(
         "plugins: {} total / {} enabled ({})",
         plugins.len(),
         enabled_plugins,
         cfg.plugin_directory()
+    );
+    println!(
+        "enabled_plugins: {}",
+        if enabled_plugin_names.is_empty() {
+            "(none)".to_string()
+        } else {
+            enabled_plugin_names.join(", ")
+        }
     );
     println!("skills: {}", cfg.enabled_skills().join(", "));
     Ok(())
@@ -1112,40 +1405,45 @@ async fn run_prompt_with_auto_tools(
         }
     };
 
+    let plugin_context = if cfg.tool_auto_router_enabled() {
+        auto_route_plugins_for_prompt(cfg, service.clone(), group_name, prompt, actor).await
+    } else {
+        Ok(None)
+    };
+
     let tool_context = if cfg.tool_auto_router_enabled() {
         auto_route_tools_for_prompt(cfg, service.clone(), group_name, prompt, actor).await
     } else {
         Ok(None)
     };
 
-    match tool_context {
-        Ok(tool_context) => {
-            let mut sections = Vec::new();
-            if let Some(context) = skill_context {
-                sections.push(("Skill context", context));
-            }
-            if let Some(context) = tool_context {
-                sections.push(("Tool context", context));
-            }
-            if sections.is_empty() {
-                return service.run_prompt(group_name, prompt, actor).await;
-            }
-
-            let mut augmented_prompt = prompt.to_string();
-            for (label, context) in sections {
-                augmented_prompt.push_str("\n\n");
-                augmented_prompt.push_str(label);
-                augmented_prompt.push_str(":\n");
-                augmented_prompt.push_str(&context);
-            }
-            augmented_prompt.push_str("\n\nUse this context if relevant.");
-            service.run_prompt(group_name, &augmented_prompt, actor).await
-        }
-        Err(err) => {
-            warn!("{actor} auto-router failed: {err:#}");
-            service.run_prompt(group_name, prompt, actor).await
-        }
+    let mut sections = Vec::new();
+    if let Some(context) = skill_context {
+        sections.push(("Skill context", context));
     }
+    match plugin_context {
+        Ok(Some(context)) => sections.push(("Plugin context", context)),
+        Ok(None) => {}
+        Err(err) => warn!("{actor} auto-plugin-router failed: {err:#}"),
+    }
+    match tool_context {
+        Ok(Some(context)) => sections.push(("Tool context", context)),
+        Ok(None) => {}
+        Err(err) => warn!("{actor} auto-tool-router failed: {err:#}"),
+    }
+    if sections.is_empty() {
+        return service.run_prompt(group_name, prompt, actor).await;
+    }
+
+    let mut augmented_prompt = prompt.to_string();
+    for (label, context) in sections {
+        augmented_prompt.push_str("\n\n");
+        augmented_prompt.push_str(label);
+        augmented_prompt.push_str(":\n");
+        augmented_prompt.push_str(&context);
+    }
+    augmented_prompt.push_str("\n\nUse this context if relevant.");
+    service.run_prompt(group_name, &augmented_prompt, actor).await
 }
 
 async fn handle_pairing_command(service: Arc<AppService>, command: PairingCommands) -> Result<()> {
@@ -2191,18 +2489,29 @@ async fn handle_audit_command(service: Arc<AppService>, command: AuditCommands) 
                 .store
                 .list_recent_audits(limit, action.as_deref(), actor.as_deref())
                 .await?;
-            for audit in rows {
+            if rows.is_empty() {
+                println!("no audits found");
+            } else {
                 println!(
-                    "{}\t{}\t{}\t{}\t{}",
-                    audit.created_at.to_rfc3339(),
-                    audit.action,
-                    audit.actor,
-                    audit.result,
-                    audit
-                        .metadata_json
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "{}".to_string())
+                    "{:<20}  {:<20}  {:<16}  {:<8}  METADATA",
+                    "TIME(UTC)", "ACTION", "ACTOR", "RESULT"
                 );
+                println!("{}", "-".repeat(128));
+                for audit in rows {
+                    let time = audit.created_at.format("%Y-%m-%d %H:%M:%S").to_string();
+                    let metadata = audit
+                        .metadata_json
+                        .map(|v| truncate_line(&v.to_string(), 64))
+                        .unwrap_or_else(|| "{}".to_string());
+                    println!(
+                        "{:<20}  {:<20}  {:<16}  {:<8}  {}",
+                        time,
+                        truncate_line(&audit.action, 20),
+                        truncate_line(&audit.actor, 16),
+                        truncate_line(&audit.result, 8),
+                        metadata
+                    );
+                }
             }
         }
     }
@@ -2856,6 +3165,279 @@ async fn execute_context_skill(
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct AutoPluginPlan {
+    #[serde(default)]
+    calls: Vec<AutoPluginCall>,
+    #[serde(default)]
+    rationale: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AutoPluginCall {
+    plugin: String,
+    command: String,
+    args: BTreeMap<String, String>,
+}
+
+async fn auto_route_plugins_for_prompt(
+    cfg: &AppConfig,
+    service: Arc<AppService>,
+    group_name: &str,
+    prompt: &str,
+    actor: &str,
+) -> Result<Option<String>> {
+    let plugins = discover_plugins(Path::new(cfg.plugin_directory()))?;
+    let enabled_plugins = plugins
+        .into_iter()
+        .filter(|plugin| cfg.is_plugin_enabled(&plugin.manifest.name))
+        .collect::<Vec<_>>();
+    if enabled_plugins.is_empty() {
+        return Ok(None);
+    }
+
+    let plan = request_auto_plugin_plan(service.clone(), group_name, prompt, &enabled_plugins).await?;
+    if plan.calls.is_empty() {
+        return Ok(None);
+    }
+
+    let mut rows = Vec::new();
+    for call in plan.calls.into_iter().take(2) {
+        let plugin_name = call.plugin.trim();
+        if plugin_name.is_empty() {
+            continue;
+        }
+        let Some(plugin) = enabled_plugins
+            .iter()
+            .find(|candidate| candidate.manifest.name.eq_ignore_ascii_case(plugin_name))
+        else {
+            continue;
+        };
+        let command = if call.command.trim().is_empty() {
+            "help".to_string()
+        } else {
+            call.command.trim().to_string()
+        };
+
+        match execute_auto_plugin_call(cfg, plugin, &command, call.args.clone(), prompt).await {
+            Ok(payload) => {
+                audit_auto_router_plugin_call(
+                    service.clone(),
+                    actor,
+                    &plugin.manifest.name,
+                    &command,
+                    "SUCCESS",
+                    Some(json!({ "preview": tool_result_preview(&payload, 1400) })),
+                )
+                .await;
+                rows.push(json!({
+                    "plugin": plugin.manifest.name,
+                    "command": command,
+                    "status": "SUCCESS",
+                    "result_preview": tool_result_preview(&payload, 1800),
+                }));
+            }
+            Err(err) => {
+                let err_text = format!("{err:#}");
+                audit_auto_router_plugin_call(
+                    service.clone(),
+                    actor,
+                    &plugin.manifest.name,
+                    &command,
+                    "FAILED",
+                    Some(json!({ "error": err_text })),
+                )
+                .await;
+                rows.push(json!({
+                    "plugin": plugin.manifest.name,
+                    "command": command,
+                    "status": "FAILED",
+                    "error": err_text,
+                }));
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(serde_json::to_string_pretty(&json!({
+        "planner_rationale": plan.rationale,
+        "calls": rows
+    }))?))
+}
+
+async fn execute_auto_plugin_call(
+    cfg: &AppConfig,
+    plugin: &PluginSpec,
+    command: &str,
+    args: BTreeMap<String, String>,
+    prompt: &str,
+) -> Result<serde_json::Value> {
+    enforce_plugin_signature_policy(cfg, plugin, false)?;
+    let bridge = create_plugin_tool_bridge_session(cfg, plugin)?;
+
+    let mut extra_env = vec![("MAID_PLUGIN_NAME".to_string(), plugin.manifest.name.clone())];
+    if let Ok(config_path) = std::env::var("MAID_CONFIG") {
+        if !config_path.trim().is_empty() {
+            extra_env.push(("MAID_CONFIG".to_string(), config_path));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        extra_env.push(("MAID_BIN".to_string(), exe.display().to_string()));
+    }
+    if let Some(session) = &bridge {
+        extra_env.push((
+            "MAID_PLUGIN_TOOL_SESSION".to_string(),
+            session.path.display().to_string(),
+        ));
+        extra_env.push(("MAID_PLUGIN_TOOL_TOKEN".to_string(), session.token.clone()));
+    }
+
+    let request = PluginRequest {
+        command: command.to_string(),
+        args,
+        input: Some(prompt.to_string()),
+        context: PluginContext {
+            actor: "auto-plugin-router".to_string(),
+            cwd: std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .display()
+                .to_string(),
+        },
+    };
+    let run_result = run_plugin_with_env(plugin, request, &extra_env).await;
+    if let Some(session) = bridge {
+        let _ = std::fs::remove_file(&session.path);
+    }
+
+    let response = run_result?;
+    if !response.ok {
+        return Err(anyhow!("plugin returned error: {}", response.message));
+    }
+    Ok(json!({
+        "message": response.message,
+        "output": response.output,
+        "data": response.data
+    }))
+}
+
+async fn request_auto_plugin_plan(
+    service: Arc<AppService>,
+    group_name: &str,
+    prompt: &str,
+    enabled_plugins: &[PluginSpec],
+) -> Result<AutoPluginPlan> {
+    let plugin_catalog = enabled_plugins
+        .iter()
+        .map(|plugin| {
+            let description = plugin
+                .manifest
+                .description
+                .clone()
+                .unwrap_or_else(|| "No description".to_string());
+            let capabilities = plugin
+                .manifest
+                .capabilities
+                .clone()
+                .unwrap_or_default()
+                .join(", ");
+            format!(
+                "- {}: {} (capabilities: {})",
+                plugin.manifest.name, description, capabilities
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let planner_prompt = format!(
+        "You are a plugin planner for a local assistant.\n\
+Return ONLY JSON with this schema:\n\
+{{\"rationale\":\"short reason\",\"calls\":[{{\"plugin\":\"name\",\"command\":\"command\",\"args\":{{\"k\":\"v\"}}}}]}}\n\
+Rules:\n\
+- Use only plugins listed below.\n\
+- Choose at most 2 calls.\n\
+- If no plugin is needed, return {{\"calls\":[]}}.\n\
+- command is required; if uncertain, use \"help\".\n\
+- Keep arguments minimal and relevant to the request.\n\
+- No markdown, no comments, no extra text.\n\n\
+Group: {group_name}\n\
+User request: {prompt}\n\n\
+Available plugins:\n{plugin_catalog}\n"
+    );
+
+    let output = service
+        .model
+        .run(ModelRunRequest {
+            group_name: group_name.to_string(),
+            prompt: planner_prompt,
+            history: Vec::new(),
+        })
+        .await?
+        .output_text;
+
+    parse_auto_plugin_plan(&output)
+}
+
+fn parse_auto_plugin_plan(raw: &str) -> Result<AutoPluginPlan> {
+    let parsed = serde_json::from_str::<serde_json::Value>(raw.trim()).or_else(|_| {
+        let extracted = extract_json_object(raw)
+            .ok_or_else(|| anyhow!("auto-plugin planner did not return valid JSON"))?;
+        serde_json::from_str::<serde_json::Value>(&extracted)
+            .context("failed to parse auto-plugin planner JSON")
+    })?;
+    normalize_auto_plugin_plan(parsed)
+}
+
+fn normalize_auto_plugin_plan(value: serde_json::Value) -> Result<AutoPluginPlan> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("auto-plugin planner payload must be a JSON object"))?;
+    let rationale = object
+        .get("rationale")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+
+    let mut calls = Vec::new();
+    if let Some(items) = object.get("calls").and_then(|v| v.as_array()) {
+        for item in items {
+            let Some(call_obj) = item.as_object() else {
+                continue;
+            };
+            let Some(plugin) = call_obj.get("plugin").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if plugin.trim().is_empty() {
+                continue;
+            }
+            let command = call_obj
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "help".to_string());
+            let mut args = BTreeMap::new();
+            if let Some(arg_obj) = call_obj.get("args").and_then(|v| v.as_object()) {
+                for (key, value) in arg_obj {
+                    if key.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some(normalized) = normalize_auto_tool_arg_value(value) {
+                        args.insert(key.clone(), normalized);
+                    }
+                }
+            }
+            calls.push(AutoPluginCall {
+                plugin: plugin.to_string(),
+                command,
+                args,
+            });
+        }
+    }
+
+    Ok(AutoPluginPlan { calls, rationale })
+}
+
 async fn auto_route_tools_for_prompt(
     cfg: &AppConfig,
     service: Arc<AppService>,
@@ -3242,6 +3824,31 @@ async fn audit_auto_router_tool_call(
             created_at: Utc::now(),
             metadata_json: Some(json!({
                 "tool": tool,
+                "metadata": metadata_json,
+            })),
+        })
+        .await;
+}
+
+async fn audit_auto_router_plugin_call(
+    service: Arc<AppService>,
+    actor: &str,
+    plugin: &str,
+    command: &str,
+    result: &str,
+    metadata_json: Option<serde_json::Value>,
+) {
+    let _ = service
+        .store
+        .insert_audit(NewAudit {
+            group_id: None,
+            action: "AUTO_PLUGIN_CALL".to_string(),
+            actor: actor.to_string(),
+            result: result.to_string(),
+            created_at: Utc::now(),
+            metadata_json: Some(json!({
+                "plugin": plugin,
+                "command": command,
                 "metadata": metadata_json,
             })),
         })
@@ -4162,7 +4769,44 @@ fn parse_gateway_command(raw: &str) -> Result<String> {
     Ok(parsed.cmd)
 }
 
-async fn run_onboard(cfg: &AppConfig, config_path: &Path) -> Result<()> {
+fn run_guide() {
+    println!("maid command guide");
+    println!();
+    println!("Chat + Groups:");
+    println!("  maid run --group <name> --prompt \"...\"");
+    println!("  maid group create <name>");
+    println!("  maid group list");
+    println!();
+    println!("Automation:");
+    println!("  maid task wizard");
+    println!("  maid task create --group <name> --name <task> --schedule \"FREQ=...\" --prompt \"...\"");
+    println!("  maid task list --group <name>");
+    println!("  maid task run-now --id <task_id>");
+    println!("  maid daemon");
+    println!();
+    println!("Operations:");
+    println!("  maid status");
+    println!("  maid onboard --interactive");
+    println!("  maid doctor");
+    println!("  maid dashboard --port 18790");
+    println!();
+    println!("Extensions:");
+    println!("  maid plugin list");
+    println!("  maid plugin registry list");
+    println!("  maid plugin registry install --name <plugin>");
+    println!("  maid plugin run --name <plugin> --command help");
+    println!();
+    println!("Naming:");
+    println!("  - Skills: auto context providers before model calls");
+    println!("  - Plugins: executable packages (local or registry) with optional tool bridge");
+}
+
+async fn run_onboard(
+    cfg: &AppConfig,
+    config_path: &Path,
+    interactive: bool,
+    service: Option<Arc<AppService>>,
+) -> Result<()> {
     std::fs::create_dir_all(parent_or_current(&cfg.database_path)?)
         .with_context(|| format!("failed to create db parent for {}", cfg.database_path))?;
     std::fs::create_dir_all(&cfg.group_root)
@@ -4241,10 +4885,37 @@ async fn run_onboard(cfg: &AppConfig, config_path: &Path) -> Result<()> {
     println!("3) cargo run -p maid -- doctor");
     println!("4) cargo run -p maid -- gateway --port 18789");
     println!("5) cargo run -p maid -- group create work");
-    println!(
-        "6) cargo run -p maid -- task create --group work --name morning-brief --schedule \"FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0\" --prompt \"Give me a concise morning brief.\""
-    );
+    println!("6) cargo run -p maid -- task wizard");
     println!("7) cargo run -p maid -- dashboard --port 18790");
+
+    if interactive {
+        if !io::stdin().is_terminal() {
+            println!("interactive mode skipped: stdin is not a terminal");
+            return Ok(());
+        }
+        println!();
+        println!("interactive setup");
+        let group_name = prompt_with_default("Create/select first group", "work")?;
+        if let Some(service) = &service {
+            service.ensure_group(&group_name, "onboard").await?;
+            println!("group ready: {}", group_name);
+
+            let should_create_task = prompt_with_default("Create first task now? (y/n)", "y")?;
+            if should_create_task.trim().eq_ignore_ascii_case("y") {
+                let task_name = prompt_with_default("Task name", "morning-brief")?;
+                let schedule_input = prompt_with_default("Schedule", "every weekday at 9am")?;
+                let schedule = schedule_from_human_or_rrule(&schedule_input)
+                    .with_context(|| format!("invalid schedule: {}", schedule_input))?;
+                let task_prompt =
+                    prompt_with_default("Task prompt", "Give me a concise morning brief.")?;
+                let task = service
+                    .create_task(&group_name, &task_name, &schedule, &task_prompt, "onboard")
+                    .await?;
+                println!("created task '{}' ({})", task.name, task.id);
+                println!("schedule: {}", schedule);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4350,10 +5021,31 @@ async fn run_doctor(cfg: &AppConfig, config_path: &Path) -> Result<()> {
 }
 
 fn write_default_config(path: &Path) -> Result<()> {
+    run_init_config(path, "personal", true)
+}
+
+fn run_init_config(path: &Path, template: &str, force: bool) -> Result<()> {
+    if path.exists() && !force {
+        return Err(anyhow!(
+            "config already exists at {} (use --force to overwrite)",
+            path.display()
+        ));
+    }
     let parent = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create config parent {}", parent.display()))?;
-    let template = r#"database_path = "data/assistant.db"
+
+    let rendered = render_config_template(template)?;
+    std::fs::write(path, rendered)
+        .with_context(|| format!("failed to write config {}", path.display()))?;
+    println!("wrote {} template to {}", template, path.display());
+    println!("next: cargo run -p maid -- onboard --interactive");
+    Ok(())
+}
+
+fn render_config_template(template: &str) -> Result<&'static str> {
+    let lower = template.trim().to_ascii_lowercase();
+    let personal = r#"database_path = "data/assistant.db"
 group_root = "groups"
 runtime = "apple_container"
 
@@ -4427,9 +5119,129 @@ allow_job_task_groups = []
 [security]
 mode = "development"
 "#;
-    std::fs::write(path, template)
-        .with_context(|| format!("failed to write default config {}", path.display()))?;
-    Ok(())
+    let work = r#"database_path = "data/assistant.db"
+group_root = "groups"
+runtime = "apple_container"
+
+[model]
+provider = "openai"
+api_key_env = "OPENAI_API_KEY"
+api_key_envs = ["OPENAI_API_KEY"]
+base_url = "https://api.openai.com/v1"
+model = "gpt-4.1-mini"
+fallback_models = ["gpt-4o-mini"]
+
+[scheduler]
+tick_seconds = 30
+max_concurrency = 4
+
+[telegram]
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+polling_timeout_seconds = 30
+dm_policy = "pairing"
+activation_mode = "mention"
+mention_token = "@maid"
+
+[skills]
+enabled = ["memory.recent", "tasks.snapshot", "group.profile"]
+
+[plugins]
+directory = "plugins"
+enabled = ["echo"]
+validate_on_startup = true
+
+[tools]
+auto_router_enabled = true
+auto_router_allowlist = ["ops.web_fetch", "ops.search", "ops.grep", "task.list", "group.list"]
+
+[policy]
+allow_job_tasks = false
+allow_job_task_groups = []
+
+[security]
+mode = "development"
+"#;
+    let security = r#"database_path = "data/assistant.db"
+group_root = "groups"
+runtime = "apple_container"
+
+[model]
+provider = "openai"
+api_key_env = "OPENAI_API_KEY"
+api_key_envs = ["OPENAI_API_KEY"]
+base_url = "https://api.openai.com/v1"
+model = "gpt-4.1-mini"
+fallback_models = ["gpt-4o-mini"]
+
+[scheduler]
+tick_seconds = 30
+max_concurrency = 2
+
+[telegram]
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+polling_timeout_seconds = 30
+dm_policy = "pairing"
+activation_mode = "mention"
+mention_token = "@maid"
+
+[skills]
+enabled = ["memory.recent", "tasks.snapshot", "group.profile"]
+
+[plugins]
+directory = "plugins"
+enabled = ["echo", "code-analysis"]
+validate_on_startup = true
+[plugins.signing]
+require_signatures = true
+trusted_keys = {}
+
+[tools]
+auto_router_enabled = true
+auto_router_allowlist = ["ops.web_fetch", "ops.search", "ops.grep", "task.list", "group.list"]
+
+[policy]
+allow_job_tasks = false
+allow_job_task_groups = []
+
+[security]
+mode = "production"
+"#;
+
+    match lower.as_str() {
+        "personal" => Ok(personal),
+        "work" => Ok(work),
+        "security" => Ok(security),
+        _ => Err(anyhow!(
+            "unknown template '{}'; expected personal, work, or security",
+            template
+        )),
+    }
+}
+
+fn remediation_hint(err: &anyhow::Error) -> Option<String> {
+    let text = format!("{err:#}").to_ascii_lowercase();
+    if text.contains("group not found") {
+        return Some("create it first: maid group create <group-name>".to_string());
+    }
+    if text.contains("invalid schedule rrule") || text.contains("unsupported schedule phrase") {
+        return Some(
+            "use `maid task wizard` or pass a valid RRULE (example: FREQ=HOURLY;INTERVAL=1)"
+                .to_string(),
+        );
+    }
+    if text.contains("missing openai api key") || text.contains("credentials missing") {
+        return Some("export OPENAI_API_KEY=... then retry (or run `maid doctor`)".to_string());
+    }
+    if text.contains("plugin") && text.contains("disabled") {
+        return Some("enable it in config or run: maid plugin enable --name <plugin>".to_string());
+    }
+    if text.contains("telegram") && text.contains("env") {
+        return Some("export TELEGRAM_BOT_TOKEN=... then retry".to_string());
+    }
+    if text.contains("config already exists") {
+        return Some("re-run with --force if you want to overwrite the file".to_string());
+    }
+    Some("run `maid doctor` for a full environment check".to_string())
 }
 
 fn telegram_chat_id_from_group_name(group_name: &str) -> Option<i64> {
@@ -4536,6 +5348,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_auto_plugin_plan_coerces_non_string_args() {
+        let raw = r#"{
+            "rationale":"run code analysis",
+            "calls":[
+                {"plugin":"code-analysis","command":"analyze","args":{"repo_path":"/tmp/repo","max_findings":20}}
+            ]
+        }"#;
+        let parsed = parse_auto_plugin_plan(raw).unwrap();
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].plugin, "code-analysis");
+        assert_eq!(parsed.calls[0].command, "analyze");
+        assert_eq!(
+            parsed.calls[0].args.get("max_findings").map(String::as_str),
+            Some("20")
+        );
+    }
+
+    #[test]
     fn parse_subagent_plan_extracts_steps() {
         let raw = r#"{
             "rationale":"split work",
@@ -4572,5 +5402,28 @@ mod tests {
         assert_eq!(parsed[0].0, "One");
         assert_eq!(parsed[0].2, "Desc & more");
         assert_eq!(parsed[1].1, "https://example.org");
+    }
+
+    #[test]
+    fn schedule_parser_supports_human_phrases() {
+        assert_eq!(
+            schedule_from_human_or_rrule("every 15 minutes").unwrap(),
+            "FREQ=MINUTELY;INTERVAL=15"
+        );
+        assert_eq!(
+            schedule_from_human_or_rrule("every hour").unwrap(),
+            "FREQ=HOURLY;INTERVAL=1"
+        );
+        assert_eq!(
+            schedule_from_human_or_rrule("every weekday at 9am").unwrap(),
+            "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0"
+        );
+    }
+
+    #[test]
+    fn parse_time_supports_am_pm_and_24h() {
+        assert_eq!(parse_time_of_day("9am").unwrap(), (9, 0));
+        assert_eq!(parse_time_of_day("9:30pm").unwrap(), (21, 30));
+        assert_eq!(parse_time_of_day("06:05").unwrap(), (6, 5));
     }
 }

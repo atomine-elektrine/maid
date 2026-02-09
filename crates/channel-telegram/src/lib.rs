@@ -198,7 +198,7 @@ impl TelegramBot {
         let cmd = raw_cmd.split('@').next().unwrap_or(raw_cmd);
 
         let response = match cmd {
-            "/start" | "/help" => help_text(),
+            "/start" | "/help" => self.help_text(chat_id),
             "/run" => {
                 if args.is_empty() {
                     "Usage: /run <prompt>".to_string()
@@ -321,6 +321,53 @@ impl TelegramBot {
         format!("telegram-{chat_id}")
     }
 
+    fn help_text(&self, chat_id: i64) -> String {
+        let activation_mode = self
+            .per_chat_activation_mode
+            .get(&chat_id)
+            .copied()
+            .unwrap_or(self.activation_mode);
+        let mention_hint = match activation_mode {
+            TelegramActivationMode::Always => "Chat activation: always-on in this chat.".to_string(),
+            TelegramActivationMode::Mention => {
+                let token = self
+                    .per_chat_mention_token
+                    .get(&chat_id)
+                    .map(|token| token.as_str())
+                    .or(self.mention_token.as_deref())
+                    .unwrap_or("@maid");
+                format!("Chat activation: mention required (prefix messages with '{token}').")
+            }
+        };
+        let dm_policy = match self.dm_policy {
+            TelegramDmPolicy::Open => "DM policy: open".to_string(),
+            TelegramDmPolicy::Pairing => {
+                "DM policy: pairing required for unknown chats (/pair <code>)".to_string()
+            }
+        };
+
+        [
+            "maid telegram quick help",
+            &mention_hint,
+            &dm_policy,
+            "",
+            "Commands:",
+            "/run <prompt>",
+            "/task_create <name>|<rrule>|<prompt>",
+            "/task_list",
+            "/task_pause <task_id>",
+            "/task_resume <task_id>",
+            "/task_run <task_id>",
+            "/pair <code>",
+            "",
+            "Examples:",
+            "/run summarize my open tasks",
+            "/task_create hourly-check|FREQ=MINUTELY;INTERVAL=15|Send me a short check-in",
+            "Any non-command message is treated as a prompt when activation rules match.",
+        ]
+        .join("\n")
+    }
+
     async fn get_updates(&self, offset: Option<i64>) -> Result<GetUpdatesResponse> {
         let mut request = self
             .client
@@ -410,21 +457,6 @@ fn format_task_list(tasks: Vec<TelegramTask>) -> String {
         ));
     }
     lines.join("\n")
-}
-
-fn help_text() -> String {
-    [
-        "maid telegram commands:",
-        "/run <prompt>",
-        "/task_create <name>|<rrule>|<prompt>",
-        "/task_list",
-        "/task_pause <task_id>",
-        "/task_resume <task_id>",
-        "/task_run <task_id>",
-        "/pair <code>",
-        "Any non-command message runs as a prompt in this chat's group.",
-    ]
-    .join("\n")
 }
 
 #[derive(Debug, Deserialize)]
