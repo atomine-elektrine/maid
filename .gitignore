@@ -2,6 +2,8 @@
 /data/*.db
 /data/*.db-shm
 /data/*.db-wal
+.env
+.env.*
 .DS_Store
 plugin-repos-local/
 plugins/code-analysis/

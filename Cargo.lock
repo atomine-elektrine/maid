@@ -1061,6 +1061,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "dotenvy",
  "maid-channel-telegram",
  "maid-core",
  "maid-model",

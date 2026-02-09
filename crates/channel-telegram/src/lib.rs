@@ -82,9 +82,11 @@ impl TelegramBot {
         if config.polling_timeout_seconds == 0 {
             return Err(anyhow!("polling_timeout_seconds must be greater than zero"));
         }
+        let request_timeout_secs = config.polling_timeout_seconds.saturating_add(15).max(20);
 
         let client = Client::builder()
-            .timeout(Duration::from_secs(20))
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(request_timeout_secs))
             .build()
             .context("failed to build telegram HTTP client")?;
 
@@ -378,7 +380,13 @@ impl TelegramBot {
             request = request.query(&[("offset", offset.to_string())]);
         }
 
-        let response = request.send().await.context("telegram getUpdates failed")?;
+        let response = request.send().await.map_err(|err| {
+            if err.is_timeout() {
+                anyhow!("telegram getUpdates timed out")
+            } else {
+                anyhow!("telegram getUpdates request failed")
+            }
+        })?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response
@@ -407,7 +415,13 @@ impl TelegramBot {
             .json(&SendMessageRequest { chat_id, text })
             .send()
             .await
-            .context("telegram sendMessage failed")?;
+            .map_err(|err| {
+                if err.is_timeout() {
+                    anyhow!("telegram sendMessage timed out")
+                } else {
+                    anyhow!("telegram sendMessage request failed")
+                }
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();

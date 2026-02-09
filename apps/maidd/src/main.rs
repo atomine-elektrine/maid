@@ -6,8 +6,9 @@ use std::io::{self, IsTerminal, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
+use std::sync::{Mutex, OnceLock};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -675,6 +676,15 @@ async fn run() -> Result<()> {
         .init();
 
     let mut cli = Cli::parse();
+    load_dotenv_file(&PathBuf::from(".env"));
+    apply_config_path_from_env(&mut cli);
+    if let Some(parent) = cli.config.parent() {
+        let config_env_path = parent.join(".env");
+        if config_env_path != PathBuf::from(".env") {
+            load_dotenv_file(&config_env_path);
+            apply_config_path_from_env(&mut cli);
+        }
+    }
     if matches!(&cli.command, Commands::Guide) {
         run_guide();
         return Ok(());
@@ -683,14 +693,7 @@ async fn run() -> Result<()> {
         run_init_config(&cli.config, template, *force)?;
         return Ok(());
     }
-    if !cli.config.exists() {
-        if let Ok(from_env) = std::env::var("MAID_CONFIG") {
-            let from_env_path = PathBuf::from(from_env);
-            if from_env_path.exists() {
-                cli.config = from_env_path;
-            }
-        }
-    }
+    apply_config_path_from_env(&mut cli);
     std::env::set_var("MAID_CONFIG", cli.config.display().to_string());
     if matches!(&cli.command, Commands::Onboard { .. }) && !cli.config.exists() {
         write_default_config(&cli.config)?;
@@ -1137,7 +1140,7 @@ async fn run_status(cfg: &AppConfig, service: Arc<AppService>) -> Result<()> {
         }
     }
 
-    let plugins = discover_plugins(Path::new(cfg.plugin_directory()))?;
+    let plugins = discover_plugins_cached(Path::new(cfg.plugin_directory()), Duration::from_secs(5))?;
     let enabled_plugins = plugins
         .iter()
         .filter(|plugin| cfg.is_plugin_enabled(&plugin.manifest.name))
@@ -1396,54 +1399,215 @@ async fn run_prompt_with_auto_tools(
     prompt: &str,
     actor: &str,
 ) -> Result<String> {
-    let skill_context = match auto_invoke_skills_for_prompt(cfg, service.clone(), group_name, actor).await
-    {
+    const CORE_PROMPT_MAX_CHARS: usize = 7900;
+    let started = Instant::now();
+
+    // Deterministic, model-free report viewing for code-analysis.
+    // This keeps "view report" / "explain findings" usable even when model credentials are missing
+    // and avoids relying on the planner to choose the right tool calls.
+    if looks_like_code_analysis_report_request(prompt) {
+        if let Ok(rendered) =
+            render_code_analysis_report(cfg, service.clone(), group_name, prompt).await
+        {
+            return Ok(rendered);
+        }
+    }
+
+    let skill_started = Instant::now();
+    let skill_context = match auto_invoke_skills_for_prompt(cfg, service.clone(), group_name, actor).await {
         Ok(context) => context,
         Err(err) => {
             warn!("{actor} skill context failed: {err:#}");
             None
         }
     };
+    debug!(
+        "{actor} prompt_pipeline stage=skills duration_ms={}",
+        skill_started.elapsed().as_millis()
+    );
 
-    let plugin_context = if cfg.tool_auto_router_enabled() {
-        auto_route_plugins_for_prompt(cfg, service.clone(), group_name, prompt, actor).await
+    let action_started = Instant::now();
+    let action_context = if cfg.tool_auto_router_enabled() {
+        auto_route_actions_for_prompt(cfg, service.clone(), group_name, prompt, actor).await
     } else {
-        Ok(None)
+        Ok(AutoActionContext::default())
     };
+    debug!(
+        "{actor} prompt_pipeline stage=auto_actions duration_ms={}",
+        action_started.elapsed().as_millis()
+    );
 
-    let tool_context = if cfg.tool_auto_router_enabled() {
-        auto_route_tools_for_prompt(cfg, service.clone(), group_name, prompt, actor).await
-    } else {
-        Ok(None)
-    };
-
+    let model_started = Instant::now();
     let mut sections = Vec::new();
     if let Some(context) = skill_context {
         sections.push(("Skill context", context));
     }
-    match plugin_context {
-        Ok(Some(context)) => sections.push(("Plugin context", context)),
-        Ok(None) => {}
-        Err(err) => warn!("{actor} auto-plugin-router failed: {err:#}"),
+    match action_context {
+        Ok(contexts) => {
+            if let Some(context) = contexts.plugin_context {
+                sections.push(("Plugin context", context));
+            }
+            if let Some(context) = contexts.tool_context {
+                sections.push(("Tool context", context));
+            }
+        }
+        Err(err) => warn!("{actor} auto-action-router failed: {err:#}"),
     }
-    match tool_context {
-        Ok(Some(context)) => sections.push(("Tool context", context)),
-        Ok(None) => {}
-        Err(err) => warn!("{actor} auto-tool-router failed: {err:#}"),
-    }
-    if sections.is_empty() {
-        return service.run_prompt(group_name, prompt, actor).await;
+    let output = if sections.is_empty() {
+        let prompt_for_model = clip_prompt_for_core(prompt, CORE_PROMPT_MAX_CHARS);
+        if prompt_for_model != prompt {
+            warn!(
+                "{actor} prompt truncated from {} to {} chars",
+                prompt.chars().count(),
+                prompt_for_model.chars().count()
+            );
+        }
+        service.run_prompt(group_name, &prompt_for_model, actor).await?
+    } else {
+        let mut augmented_prompt = prompt.to_string();
+        for (label, context) in sections {
+            augmented_prompt.push_str("\n\n");
+            augmented_prompt.push_str(label);
+            augmented_prompt.push_str(":\n");
+            augmented_prompt.push_str(&context);
+        }
+        augmented_prompt.push_str("\n\nUse this context if relevant.");
+        let prompt_for_model = clip_prompt_for_core(&augmented_prompt, CORE_PROMPT_MAX_CHARS);
+        if prompt_for_model != augmented_prompt {
+            warn!(
+                "{actor} augmented prompt truncated from {} to {} chars",
+                augmented_prompt.chars().count(),
+                prompt_for_model.chars().count()
+            );
+        }
+        service.run_prompt(group_name, &prompt_for_model, actor).await?
+    };
+    debug!(
+        "{actor} prompt_pipeline stage=model duration_ms={}",
+        model_started.elapsed().as_millis()
+    );
+    info!(
+        "{actor} prompt_pipeline total_duration_ms={}",
+        started.elapsed().as_millis()
+    );
+    Ok(output)
+}
+
+async fn render_code_analysis_report(
+    cfg: &AppConfig,
+    service: Arc<AppService>,
+    group_name: &str,
+    prompt: &str,
+) -> Result<String> {
+    let workflow_id = extract_code_analysis_workflow_id(prompt);
+    let lowered = prompt.to_ascii_lowercase();
+    let include_markdown = lowered.contains("view") || lowered.contains("report");
+    let top_n = if lowered.contains("findings") || lowered.contains("explain") {
+        25
+    } else {
+        10
+    };
+
+    let mut args = BTreeMap::new();
+    args.insert("group".to_string(), group_name.to_string());
+    args.insert("include_markdown".to_string(), include_markdown.to_string());
+    args.insert("max_chars".to_string(), "3500".to_string());
+    args.insert("top_n".to_string(), top_n.to_string());
+    if let Some(wf) = workflow_id {
+        args.insert("workflow_id".to_string(), wf);
     }
 
-    let mut augmented_prompt = prompt.to_string();
-    for (label, context) in sections {
-        augmented_prompt.push_str("\n\n");
-        augmented_prompt.push_str(label);
-        augmented_prompt.push_str(":\n");
-        augmented_prompt.push_str(&context);
+    let payload = execute_code_analysis_latest_tool(cfg, service, "ops.code_analysis.latest", args)
+        .await
+        .context("code-analysis lookup failed")?;
+    format_code_analysis_latest_payload(&payload)
+}
+
+fn format_code_analysis_latest_payload(payload: &serde_json::Value) -> Result<String> {
+    let workflow_id = payload
+        .get("workflow_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unknown>");
+    let target_url = payload
+        .get("target_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let stats = payload.get("stats").and_then(|v| v.as_object());
+    let findings = stats
+        .and_then(|s| s.get("reportable_findings"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let supply_chain = stats
+        .and_then(|s| s.get("supply_chain_findings"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let queue_entries = stats
+        .and_then(|s| s.get("queue_entries"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let coverage_warning = stats
+        .and_then(|s| s.get("coverage_warning"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Code analysis report\nworkflow={workflow_id} findings={findings} supply_chain={supply_chain} queue_entries={queue_entries}"
+    ));
+    if !target_url.is_empty() {
+        lines.push(format!("target_url={target_url}"));
     }
-    augmented_prompt.push_str("\n\nUse this context if relevant.");
-    service.run_prompt(group_name, &augmented_prompt, actor).await
+    if let Some(warning) = coverage_warning {
+        lines.push(format!("coverage_warning={}", truncate_line(warning, 220)));
+    }
+
+    if let Some(top) = payload.get("top_findings").and_then(|v| v.as_array()) {
+        if !top.is_empty() {
+            lines.push("top_findings:".to_string());
+            for item in top.iter().take(25) {
+                let sev = item.get("severity").and_then(|v| v.as_str()).unwrap_or("?");
+                let cat = item.get("category").and_then(|v| v.as_str()).unwrap_or("?");
+                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                let path = item.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                lines.push(format!("- {sev} {cat} {id} {path}"));
+            }
+        }
+    }
+
+    if let Some(preview) = payload
+        .get("markdown_preview")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        lines.push("".to_string());
+        lines.push("report_preview:".to_string());
+        lines.push(preview.to_string());
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn clip_prompt_for_core(input: &str, max_chars: usize) -> String {
+    let input_len = input.chars().count();
+    if input_len <= max_chars {
+        return input.to_string();
+    }
+    let reserve = 80usize;
+    let keep = max_chars.saturating_sub(reserve);
+    let mut truncated = input.chars().take(keep).collect::<String>();
+    truncated.push_str("\n\n[truncated to fit prompt limit]");
+    truncated
+}
+
+#[derive(Default)]
+struct AutoActionContext {
+    plugin_context: Option<String>,
+    tool_context: Option<String>,
 }
 
 async fn handle_pairing_command(service: Arc<AppService>, command: PairingCommands) -> Result<()> {
@@ -1872,6 +2036,10 @@ async fn handle_plugin_command(
                         .to_string(),
                 },
             };
+            eprintln!(
+                "[plugin] running {} v{}...",
+                plugin.manifest.name, plugin.manifest.version
+            );
             let bridge = create_plugin_tool_bridge_session(cfg, &plugin)?;
             let mut extra_env = vec![
                 ("MAID_CONFIG".to_string(), config_path.display().to_string()),
@@ -1896,6 +2064,7 @@ async fn handle_plugin_command(
             if !response.ok {
                 return Err(anyhow!("plugin returned error: {}", response.message));
             }
+            eprintln!("[plugin] done {} ok", plugin.manifest.name);
             println!("{}", response.message);
             if let Some(output) = response.output {
                 println!("{output}");
@@ -2692,6 +2861,10 @@ async fn execute_tool_call(
         "ops.web_fetch" => execute_web_fetch_tool(cfg, tool, args).await,
         "ops.search" => execute_web_search_tool(cfg, tool, args).await,
         "ops.grep" => execute_grep_tool(cfg, service, tool, args).await,
+        "ops.code_analysis.latest" => {
+            execute_code_analysis_latest_tool(cfg, service, tool, args).await
+        }
+        "ops.code_analysis.list" => execute_code_analysis_list_tool(service, tool, args).await,
         _ => Err(anyhow!("unsupported tool '{}'", tool)),
     }
 }
@@ -3031,12 +3204,309 @@ async fn execute_grep_tool(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct CodeAnalysisWorkflow {
+    workflow_id: String,
+    #[serde(default)]
+    target_url: Option<String>,
+    #[serde(default)]
+    artifacts: BTreeMap<String, String>,
+    #[serde(default)]
+    stats: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    notes: Vec<String>,
+}
+
+struct LocatedWorkflow {
+    workflow_path: PathBuf,
+    modified_secs: u64,
+}
+
+async fn execute_code_analysis_list_tool(
+    service: Arc<AppService>,
+    tool: &str,
+    args: BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
+    let group_name = required_arg(&args, "group")?;
+    let limit = parse_u64_arg(&args, "limit", 10, 1, 50)? as usize;
+
+    let group = service
+        .store
+        .get_group_by_name(group_name)
+        .await?
+        .ok_or_else(|| anyhow!("group not found: {group_name}"))?;
+    let group_root = fs::canonicalize(&group.root_path)
+        .with_context(|| format!("failed to resolve group root {}", group.root_path))?;
+
+    let workflows_dir = group_root
+        .join(".maid")
+        .join("code-analysis")
+        .join("workflows");
+    let mut rows: Vec<(u64, PathBuf)> = Vec::new();
+    if workflows_dir.is_dir() {
+        for entry in fs::read_dir(&workflows_dir)
+            .with_context(|| format!("failed to read {}", workflows_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|v| v.to_str()) != Some("json") {
+                continue;
+            }
+            let modified_secs = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            rows.push((modified_secs, path));
+        }
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.truncate(limit);
+
+    let mut workflows = Vec::new();
+    for (_, path) in rows {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let wf: CodeAnalysisWorkflow = serde_json::from_str(&raw)
+            .with_context(|| format!("invalid workflow JSON {}", path.display()))?;
+        workflows.push(json!({
+            "workflow_id": wf.workflow_id,
+            "target_url": wf.target_url,
+            "reportable_findings": wf.stats.get("reportable_findings"),
+            "supply_chain_findings": wf.stats.get("supply_chain_findings"),
+            "queue_entries": wf.stats.get("queue_entries"),
+            "coverage_warning": wf.stats.get("coverage_warning"),
+            "notes": wf.notes.into_iter().take(3).collect::<Vec<_>>(),
+        }));
+    }
+
+    Ok(json!({
+        "tool": tool,
+        "group": group_name,
+        "workflows_dir": workflows_dir.display().to_string(),
+        "workflows": workflows,
+    }))
+}
+
+async fn execute_code_analysis_latest_tool(
+    _cfg: &AppConfig,
+    service: Arc<AppService>,
+    tool: &str,
+    args: BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
+    let group_name = required_arg(&args, "group")?;
+    let workflow_id = args
+        .get("workflow_id")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let include_markdown = parse_bool_arg(&args, "include_markdown", false)?;
+    let max_chars = parse_u64_arg(&args, "max_chars", 3500, 200, 12_000)? as usize;
+    let top_n = parse_u64_arg(&args, "top_n", 10, 1, 50)? as usize;
+
+    let group = service
+        .store
+        .get_group_by_name(group_name)
+        .await?
+        .ok_or_else(|| anyhow!("group not found: {group_name}"))?;
+    let group_root = fs::canonicalize(&group.root_path)
+        .with_context(|| format!("failed to resolve group root {}", group.root_path))?;
+
+    let mut search_roots = vec![group_root.join(".maid").join("code-analysis")];
+    search_roots.push(PathBuf::from("/private/tmp/maid-code-analysis-sources"));
+
+    let located = find_code_analysis_workflow(&search_roots, workflow_id.as_deref())?
+        .ok_or_else(|| anyhow!("no code-analysis workflow found"))?;
+    let raw = fs::read_to_string(&located.workflow_path)
+        .with_context(|| format!("failed to read {}", located.workflow_path.display()))?;
+    let wf: CodeAnalysisWorkflow = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid workflow JSON {}", located.workflow_path.display()))?;
+
+    let markdown_path = wf.artifacts.get("markdown").cloned();
+    let sarif_path = wf.artifacts.get("sarif").cloned();
+    let findings_path = wf.artifacts.get("findings").cloned();
+
+    let top_findings = if let Some(path) = findings_path.as_deref() {
+        read_code_analysis_findings_preview(path, top_n).unwrap_or_else(|err| {
+            vec![json!({
+                "error": format!("failed to read findings: {err:#}"),
+                "path": path,
+            })]
+        })
+    } else {
+        Vec::new()
+    };
+
+    let markdown_preview = if include_markdown {
+        markdown_path
+            .as_deref()
+            .and_then(|path| read_text_preview(path, max_chars).ok())
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "tool": tool,
+        "group": group_name,
+        "workflow_id": wf.workflow_id,
+        "target_url": wf.target_url,
+        "stats": wf.stats,
+        "notes": wf.notes,
+        "artifacts": {
+            "workflow": located.workflow_path.display().to_string(),
+            "markdown": markdown_path,
+            "sarif": sarif_path,
+            "findings": findings_path,
+        },
+        "top_findings": top_findings,
+        "markdown_preview": markdown_preview,
+    }))
+}
+
+fn find_code_analysis_workflow(
+    roots: &[PathBuf],
+    workflow_id: Option<&str>,
+) -> Result<Option<LocatedWorkflow>> {
+    let mut best: Option<LocatedWorkflow> = None;
+
+    for root in roots {
+        if root.ends_with("maid-code-analysis-sources") {
+            if !root.is_dir() {
+                continue;
+            }
+            for child in fs::read_dir(root)
+                .with_context(|| format!("failed to read {}", root.display()))?
+            {
+                let child = child?;
+                if !child.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let workflows_dir = child
+                    .path()
+                    .join("code-analysis-reports")
+                    .join("workflows");
+                consider_workflows_dir(&workflows_dir, workflow_id, &mut best)?;
+                if workflow_id.is_some() && best.is_some() {
+                    return Ok(best);
+                }
+            }
+            continue;
+        }
+
+        let workflows_dir = root.join("workflows");
+        consider_workflows_dir(&workflows_dir, workflow_id, &mut best)?;
+        if workflow_id.is_some() && best.is_some() {
+            return Ok(best);
+        }
+    }
+
+    Ok(best)
+}
+
+fn consider_workflows_dir(
+    workflows_dir: &Path,
+    workflow_id: Option<&str>,
+    best: &mut Option<LocatedWorkflow>,
+) -> Result<()> {
+    if !workflows_dir.is_dir() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(workflows_dir)
+        .with_context(|| format!("failed to read {}", workflows_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|v| v.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(wf) = workflow_id {
+            if path.file_name().and_then(|v| v.to_str()) != Some(&format!("{wf}.json")) {
+                continue;
+            }
+        }
+
+        let modified_secs = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        match best {
+            Some(current) => {
+                if workflow_id.is_some() {
+                    *best = Some(LocatedWorkflow {
+                        workflow_path: path,
+                        modified_secs,
+                    });
+                    return Ok(());
+                }
+                if modified_secs > current.modified_secs {
+                    *best = Some(LocatedWorkflow {
+                        workflow_path: path,
+                        modified_secs,
+                    });
+                }
+            }
+            None => {
+                *best = Some(LocatedWorkflow {
+                    workflow_path: path,
+                    modified_secs,
+                });
+                if workflow_id.is_some() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn read_text_preview(path: &str, max_chars: usize) -> Result<String> {
+    let raw = fs::read_to_string(path).with_context(|| format!("failed to read {}", path))?;
+    if raw.chars().count() <= max_chars {
+        return Ok(raw);
+    }
+    let mut out = raw.chars().take(max_chars).collect::<String>();
+    out.push_str("\n\n[truncated]");
+    Ok(out)
+}
+
+fn read_code_analysis_findings_preview(path: &str, top_n: usize) -> Result<Vec<serde_json::Value>> {
+    let raw = fs::read_to_string(path).with_context(|| format!("failed to read {}", path))?;
+    let parsed: Vec<serde_json::Value> =
+        serde_json::from_str(&raw).with_context(|| format!("invalid JSON {}", path))?;
+    let mut out = Vec::new();
+    for finding in parsed.into_iter().take(top_n) {
+        let get = |k: &str| finding.get(k).cloned();
+        out.push(json!({
+            "id": get("id"),
+            "severity": get("severity"),
+            "category": get("category"),
+            "vulnerability_type": get("vulnerability_type"),
+            "path": get("path"),
+            "sink_call": get("sink_call"),
+            "witness_payload": get("witness_payload"),
+            "exploit_verdict": get("exploit_verdict"),
+            "impact": get("impact"),
+            "remediation": get("remediation"),
+            "confidence": get("confidence"),
+        }));
+    }
+    Ok(out)
+}
+
 async fn auto_invoke_skills_for_prompt(
     cfg: &AppConfig,
     service: Arc<AppService>,
     group_name: &str,
     actor: &str,
 ) -> Result<Option<String>> {
+    let show_progress = should_print_auto_action_progress(actor);
     let mut rows = Vec::new();
     for skill in cfg.enabled_skills().into_iter().take(8) {
         if !is_supported_context_skill(&skill) {
@@ -3057,8 +3527,14 @@ async fn auto_invoke_skills_for_prompt(
             continue;
         }
 
+        if show_progress {
+            eprintln!("[auto] -> skill {}", skill);
+        }
         match execute_context_skill(cfg, service.clone(), group_name, &skill).await {
             Ok(payload) => {
+                if show_progress {
+                    eprintln!("[auto] <- skill {} ok", skill);
+                }
                 audit_auto_skill_context_call(
                     service.clone(),
                     actor,
@@ -3075,6 +3551,13 @@ async fn auto_invoke_skills_for_prompt(
             }
             Err(err) => {
                 let err_text = format!("{err:#}");
+                if show_progress {
+                    eprintln!(
+                        "[auto] <- skill {} failed: {}",
+                        skill,
+                        truncate_line(&err_text, 200)
+                    );
+                }
                 audit_auto_skill_context_call(
                     service.clone(),
                     actor,
@@ -3165,44 +3648,171 @@ async fn execute_context_skill(
     }
 }
 
+#[derive(Clone)]
+struct PluginDiscoveryCacheEntry {
+    plugins_dir: String,
+    loaded_at: Instant,
+    plugins: Vec<PluginSpec>,
+}
+
+static PLUGIN_DISCOVERY_CACHE: OnceLock<Mutex<Option<PluginDiscoveryCacheEntry>>> = OnceLock::new();
+
+fn discover_plugins_cached(plugins_dir: &Path, ttl: Duration) -> Result<Vec<PluginSpec>> {
+    let key = plugins_dir.display().to_string();
+    let cache = PLUGIN_DISCOVERY_CACHE.get_or_init(|| Mutex::new(None));
+
+    if let Ok(guard) = cache.lock() {
+        if let Some(entry) = guard.as_ref() {
+            if entry.plugins_dir == key && entry.loaded_at.elapsed() <= ttl {
+                return Ok(entry.plugins.clone());
+            }
+        }
+    }
+
+    let plugins = discover_plugins(plugins_dir)?;
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(PluginDiscoveryCacheEntry {
+            plugins_dir: key,
+            loaded_at: Instant::now(),
+            plugins: plugins.clone(),
+        });
+    }
+    Ok(plugins)
+}
+
 #[derive(Debug, Clone, Deserialize)]
-struct AutoPluginPlan {
-    #[serde(default)]
-    calls: Vec<AutoPluginCall>,
+struct AutoActionPlan {
     #[serde(default)]
     rationale: Option<String>,
+    #[serde(default)]
+    tools: Vec<AutoToolCall>,
+    #[serde(default)]
+    plugins: Vec<AutoPluginCall>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct AutoPluginCall {
-    plugin: String,
-    command: String,
-    args: BTreeMap<String, String>,
-}
-
-async fn auto_route_plugins_for_prompt(
+async fn auto_route_actions_for_prompt(
     cfg: &AppConfig,
     service: Arc<AppService>,
     group_name: &str,
     prompt: &str,
     actor: &str,
-) -> Result<Option<String>> {
-    let plugins = discover_plugins(Path::new(cfg.plugin_directory()))?;
-    let enabled_plugins = plugins
+) -> Result<AutoActionContext> {
+    let started = Instant::now();
+    let show_progress = should_print_auto_action_progress(actor);
+    let allowed_tools = cfg
+        .tool_auto_router_allowlist()
         .into_iter()
-        .filter(|plugin| cfg.is_plugin_enabled(&plugin.manifest.name))
+        .filter(|name| is_supported_plugin_tool(name))
+        .filter(|name| name != "run.prompt")
         .collect::<Vec<_>>();
-    if enabled_plugins.is_empty() {
-        return Ok(None);
+    let enabled_plugins = discover_plugins_cached(
+        Path::new(cfg.plugin_directory()),
+        Duration::from_secs(5),
+    )?
+    .into_iter()
+    .filter(|plugin| cfg.is_plugin_enabled(&plugin.manifest.name))
+    .collect::<Vec<_>>();
+
+    if allowed_tools.is_empty() && enabled_plugins.is_empty() {
+        return Ok(AutoActionContext::default());
     }
 
-    let plan = request_auto_plugin_plan(service.clone(), group_name, prompt, &enabled_plugins).await?;
-    if plan.calls.is_empty() {
-        return Ok(None);
+    // Fast-path: deterministic report viewing requests. This makes chat interfaces (Telegram, CLI)
+    // feel "universal" without relying on the planner to guess the right tool call.
+    if allowed_tools
+        .iter()
+        .any(|name| name == "ops.code_analysis.latest")
+        && looks_like_code_analysis_report_request(prompt)
+    {
+        let workflow_id = extract_code_analysis_workflow_id(prompt);
+        let include_markdown = prompt.to_ascii_lowercase().contains("view")
+            || prompt.to_ascii_lowercase().contains("report");
+        let top_n = if prompt.to_ascii_lowercase().contains("findings")
+            || prompt.to_ascii_lowercase().contains("explain")
+        {
+            "25"
+        } else {
+            "10"
+        };
+        let mut args = BTreeMap::new();
+        args.insert("group".to_string(), group_name.to_string());
+        args.insert("include_markdown".to_string(), include_markdown.to_string());
+        args.insert("max_chars".to_string(), "3500".to_string());
+        args.insert("top_n".to_string(), top_n.to_string());
+        if let Some(wf) = workflow_id {
+            args.insert("workflow_id".to_string(), wf);
+        }
+
+        match execute_tool_call(cfg, service.clone(), "ops.code_analysis.latest", args, actor).await
+        {
+            Ok(payload) => {
+                let tool_context =
+                    Some(serde_json::to_string_pretty(&json!({ "calls": [payload] }))?);
+                return Ok(AutoActionContext {
+                    plugin_context: None,
+                    tool_context,
+                });
+            }
+            Err(err) => {
+                warn!("{actor} ops.code_analysis.latest fast-path failed: {err:#}");
+            }
+        }
     }
 
-    let mut rows = Vec::new();
-    for call in plan.calls.into_iter().take(2) {
+    if show_progress {
+        eprintln!(
+            "[auto] planning actions (tools={}, plugins={})...",
+            allowed_tools.len(),
+            enabled_plugins.len()
+        );
+    }
+    let plan = request_auto_action_plan(
+        service.clone(),
+        group_name,
+        prompt,
+        &allowed_tools,
+        &enabled_plugins,
+    )
+    .await?;
+    if show_progress && (!plan.tools.is_empty() || !plan.plugins.is_empty()) {
+        let mut summary = Vec::new();
+        if !plan.tools.is_empty() {
+            let tools = plan
+                .tools
+                .iter()
+                .map(|call| call.tool.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            summary.push(format!("tools=[{}]", tools));
+        }
+        if !plan.plugins.is_empty() {
+            let plugins = plan
+                .plugins
+                .iter()
+                .map(|call| format!("{}/{}", call.plugin, call.command))
+                .collect::<Vec<_>>()
+                .join(", ");
+            summary.push(format!("plugins=[{}]", plugins));
+        }
+        if let Some(rationale) = plan
+            .rationale
+            .as_ref()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        {
+            summary.push(format!("rationale={}", json_string(rationale)));
+        }
+        eprintln!("[auto] plan {}", summary.join(" "));
+    }
+    debug!(
+        "{actor} auto_action_plan tools={} plugins={} duration_ms={}",
+        plan.tools.len(),
+        plan.plugins.len(),
+        started.elapsed().as_millis()
+    );
+
+    let mut plugin_rows = Vec::new();
+    for call in plan.plugins.into_iter().take(2) {
         let plugin_name = call.plugin.trim();
         if plugin_name.is_empty() {
             continue;
@@ -3218,27 +3828,60 @@ async fn auto_route_plugins_for_prompt(
         } else {
             call.command.trim().to_string()
         };
-
-        match execute_auto_plugin_call(cfg, plugin, &command, call.args.clone(), prompt).await {
+        if show_progress {
+            eprintln!(
+                "[auto] -> plugin {} {} {}",
+                plugin.manifest.name,
+                command,
+                format_plugin_call_args(&call.args)
+            );
+        }
+        match execute_auto_plugin_call(
+            cfg,
+            service.clone(),
+            group_name,
+            plugin,
+            &command,
+            call.args.clone(),
+            prompt,
+        )
+        .await
+        {
             Ok(payload) => {
+                if show_progress {
+                    eprintln!(
+                        "[auto] <- plugin {} ok{}",
+                        plugin.manifest.name,
+                        summarize_plugin_payload(&payload)
+                            .map(|v| format!(" ({v})"))
+                            .unwrap_or_default()
+                    );
+                }
                 audit_auto_router_plugin_call(
                     service.clone(),
                     actor,
                     &plugin.manifest.name,
                     &command,
                     "SUCCESS",
-                    Some(json!({ "preview": tool_result_preview(&payload, 1400) })),
+                    Some(json!({ "preview": tool_result_preview(&payload, 1200) })),
                 )
                 .await;
-                rows.push(json!({
+                plugin_rows.push(json!({
                     "plugin": plugin.manifest.name,
                     "command": command,
                     "status": "SUCCESS",
-                    "result_preview": tool_result_preview(&payload, 1800),
+                    "result_preview": tool_result_preview(&payload, 1600),
                 }));
             }
             Err(err) => {
                 let err_text = format!("{err:#}");
+                if show_progress {
+                    eprintln!(
+                        "[auto] <- plugin {} failed: {}",
+                        plugin.manifest.name,
+                        truncate_line(&err_text, 240)
+                    );
+                }
                 audit_auto_router_plugin_call(
                     service.clone(),
                     actor,
@@ -3248,7 +3891,7 @@ async fn auto_route_plugins_for_prompt(
                     Some(json!({ "error": err_text })),
                 )
                 .await;
-                rows.push(json!({
+                plugin_rows.push(json!({
                     "plugin": plugin.manifest.name,
                     "command": command,
                     "status": "FAILED",
@@ -3258,25 +3901,451 @@ async fn auto_route_plugins_for_prompt(
         }
     }
 
-    if rows.is_empty() {
-        return Ok(None);
+    let mut tool_rows = Vec::new();
+    for call in plan.tools.into_iter().take(3) {
+        if !allowed_tools.iter().any(|name| name == &call.tool) {
+            continue;
+        }
+        let tool = call.tool.clone();
+        let args = call.args.clone();
+        if show_progress {
+            eprintln!("[auto] -> tool {} {}", tool, format_tool_call_args(&tool, &args));
+        }
+        match execute_tool_call(cfg, service.clone(), &tool, args, actor).await {
+            Ok(payload) => {
+                if show_progress {
+                    eprintln!(
+                        "[auto] <- tool {} ok{}",
+                        tool,
+                        summarize_tool_payload(&tool, &payload)
+                            .map(|v| format!(" ({v})"))
+                            .unwrap_or_default()
+                    );
+                }
+                audit_auto_router_tool_call(
+                    service.clone(),
+                    actor,
+                    &tool,
+                    "SUCCESS",
+                    Some(json!({ "preview": tool_result_preview(&payload, 1200) })),
+                )
+                .await;
+                tool_rows.push(json!({
+                    "tool": tool,
+                    "status": "SUCCESS",
+                    "result_preview": tool_result_preview(&payload, 1600),
+                }));
+            }
+            Err(err) => {
+                let err_text = format!("{err:#}");
+                if show_progress {
+                    eprintln!(
+                        "[auto] <- tool {} failed: {}",
+                        tool,
+                        truncate_line(&err_text, 240)
+                    );
+                }
+                audit_auto_router_tool_call(
+                    service.clone(),
+                    actor,
+                    &tool,
+                    "FAILED",
+                    Some(json!({ "error": err_text })),
+                )
+                .await;
+                tool_rows.push(json!({
+                    "tool": tool,
+                    "status": "FAILED",
+                    "error": err_text,
+                }));
+            }
+        }
     }
 
-    Ok(Some(serde_json::to_string_pretty(&json!({
-        "planner_rationale": plan.rationale,
-        "calls": rows
-    }))?))
+    let plugin_context = if plugin_rows.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string_pretty(&json!({
+            "planner_rationale": plan.rationale.clone(),
+            "calls": plugin_rows
+        }))?)
+    };
+    let tool_context = if tool_rows.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string_pretty(&json!({
+            "planner_rationale": plan.rationale,
+            "calls": tool_rows
+        }))?)
+    };
+
+    let context = AutoActionContext {
+        plugin_context,
+        tool_context,
+    };
+    debug!(
+        "{actor} auto_action_execute duration_ms={}",
+        started.elapsed().as_millis()
+    );
+    Ok(context)
 }
 
+fn should_print_auto_action_progress(actor: &str) -> bool {
+    // Only print progress for interactive CLI flows.
+    actor == "cli" || actor.starts_with("subagent-")
+}
+
+fn looks_like_code_analysis_report_request(prompt: &str) -> bool {
+    let lowered = prompt.trim().to_ascii_lowercase();
+    if lowered.is_empty() {
+        return false;
+    }
+    let keywords = [
+        "view report",
+        "show report",
+        "open report",
+        "explain findings",
+        "show findings",
+        "list findings",
+        "sarif",
+        "workflow",
+    ];
+    keywords.iter().any(|k| lowered.contains(k))
+}
+
+fn extract_code_analysis_workflow_id(prompt: &str) -> Option<String> {
+    // Very small "parser": locate the first token that looks like wf-YYYYMMDDTHHMMSSZ.
+    // We also accept any token starting with "wf-" to support future formats.
+    for token in prompt
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == ')' || c == '(')
+        .map(str::trim)
+    {
+        if token.len() < 4 {
+            continue;
+        }
+        if token.to_ascii_lowercase().starts_with("wf-") {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
+fn json_string(raw: &str) -> String {
+    serde_json::to_string(raw).unwrap_or_else(|_| format!("\"{}\"", raw))
+}
+
+fn format_tool_call_args(tool: &str, args: &BTreeMap<String, String>) -> String {
+    let keys: &[&str] = match tool {
+        "ops.search" => &["query", "limit"],
+        "ops.web_fetch" => &["url"],
+        "ops.grep" => &["group", "pattern", "path"],
+        "ops.code_analysis.latest" => &["group", "workflow_id", "top_n", "include_markdown"],
+        "ops.code_analysis.list" => &["group", "limit"],
+        "task.list" => &["group"],
+        "task.create" => &["group", "name", "schedule"],
+        "task.run_now" => &["id"],
+        "task.pause" => &["id"],
+        "task.resume" => &["id"],
+        "task.delete" => &["id"],
+        "task.clear_group" => &["group"],
+        "group.create" => &["name"],
+        _ => &[],
+    };
+    let rendered = format_args_kv(args, keys, 4);
+    if rendered.is_empty() {
+        "(no args)".to_string()
+    } else {
+        rendered
+    }
+}
+
+fn format_plugin_call_args(args: &BTreeMap<String, String>) -> String {
+    let rendered = format_args_kv(
+        args,
+        &[
+            "repo_url",
+            "repo_path",
+            "repo_ref",
+            "target_url",
+            "output_dir",
+            "categories",
+        ],
+        6,
+    );
+    if rendered.is_empty() {
+        "(no args)".to_string()
+    } else {
+        rendered
+    }
+}
+
+fn format_args_kv(args: &BTreeMap<String, String>, keys: &[&str], max_items: usize) -> String {
+    let mut parts = Vec::new();
+    for key in keys {
+        if let Some(value) = args.get(*key) {
+            if value.trim().is_empty() {
+                continue;
+            }
+            parts.push(format!("{key}={}", json_string(value)));
+        }
+    }
+
+    if parts.is_empty() {
+        for (key, value) in args.iter().take(max_items) {
+            if key.trim().is_empty() || value.trim().is_empty() {
+                continue;
+            }
+            parts.push(format!("{key}={}", json_string(value)));
+        }
+    }
+
+    truncate_line(&parts.join(" "), 220)
+}
+
+fn summarize_tool_payload(tool: &str, payload: &serde_json::Value) -> Option<String> {
+    match tool {
+        "ops.search" => payload
+            .get("results")
+            .and_then(|v| v.as_array())
+            .map(|items| format!("results={}", items.len())),
+        "ops.web_fetch" => payload
+            .get("status_code")
+            .and_then(|v| v.as_u64())
+            .map(|code| format!("status={}", code)),
+        "ops.grep" => payload
+            .get("matches")
+            .and_then(|v| v.as_array())
+            .map(|items| format!("matches={}", items.len())),
+        "ops.code_analysis.latest" => payload
+            .get("top_findings")
+            .and_then(|v| v.as_array())
+            .map(|items| format!("top_findings={}", items.len())),
+        "ops.code_analysis.list" => payload
+            .get("workflows")
+            .and_then(|v| v.as_array())
+            .map(|items| format!("workflows={}", items.len())),
+        "task.list" => payload
+            .get("tasks")
+            .and_then(|v| v.as_array())
+            .map(|items| format!("tasks={}", items.len())),
+        "group.list" => payload
+            .get("groups")
+            .and_then(|v| v.as_array())
+            .map(|items| format!("groups={}", items.len())),
+        _ => None,
+    }
+}
+
+fn summarize_plugin_payload(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(|v| format!("message={}", truncate_line(v, 100)))
+}
+
+async fn request_auto_action_plan(
+    service: Arc<AppService>,
+    group_name: &str,
+    prompt: &str,
+    allowed_tools: &[String],
+    enabled_plugins: &[PluginSpec],
+) -> Result<AutoActionPlan> {
+    let tool_catalog = if allowed_tools.is_empty() {
+        "- (none)".to_string()
+    } else {
+        allowed_tools
+            .iter()
+            .map(|name| {
+                let summary = tool_summary(name).unwrap_or("No summary available");
+                format!("- {name}: {summary}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let plugin_catalog = if enabled_plugins.is_empty() {
+        "- (none)".to_string()
+    } else {
+        enabled_plugins
+            .iter()
+            .map(|plugin| {
+                let description = plugin
+                    .manifest
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| "No description".to_string());
+                format!("- {}: {}", plugin.manifest.name, description)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let planner_prompt = format!(
+        "You are an action planner for a local assistant.\n\
+Return ONLY JSON with this schema:\n\
+{{\"rationale\":\"short reason\",\"tools\":[{{\"tool\":\"name\",\"args\":{{\"k\":\"v\"}}}}],\"plugins\":[{{\"plugin\":\"name\",\"command\":\"command\",\"args\":{{\"k\":\"v\"}}}}]}}\n\
+Rules:\n\
+- Use only tools/plugins listed below.\n\
+- At most 3 tool calls and 2 plugin calls.\n\
+- Prefer read operations.\n\
+- If nothing is needed, return empty arrays.\n\
+- If plugin command is uncertain, use \"help\".\n\
+- No markdown, no comments, no extra text.\n\n\
+Group: {group_name}\n\
+User request: {prompt}\n\n\
+Available tools:\n{tool_catalog}\n\n\
+Available plugins:\n{plugin_catalog}\n"
+    );
+
+    let output = service
+        .model
+        .run(ModelRunRequest {
+            group_name: group_name.to_string(),
+            prompt: planner_prompt,
+            history: Vec::new(),
+        })
+        .await?
+        .output_text;
+
+    parse_auto_action_plan(&output)
+}
+
+fn parse_auto_action_plan(raw: &str) -> Result<AutoActionPlan> {
+    let parsed = serde_json::from_str::<serde_json::Value>(raw.trim()).or_else(|_| {
+        let extracted = extract_json_object(raw)
+            .ok_or_else(|| anyhow!("auto-action planner did not return valid JSON"))?;
+        serde_json::from_str::<serde_json::Value>(&extracted)
+            .context("failed to parse auto-action planner JSON")
+    })?;
+    normalize_auto_action_plan(parsed)
+}
+
+fn normalize_auto_action_plan(value: serde_json::Value) -> Result<AutoActionPlan> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("auto-action planner payload must be a JSON object"))?;
+    let rationale = object
+        .get("rationale")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+
+    let tools = object
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_object())
+                .filter_map(|call_obj| {
+                    let tool = call_obj.get("tool").and_then(|v| v.as_str())?;
+                    if tool.trim().is_empty() {
+                        return None;
+                    }
+                    let mut args = BTreeMap::new();
+                    if let Some(arg_obj) = call_obj.get("args").and_then(|v| v.as_object()) {
+                        for (key, value) in arg_obj {
+                            if key.trim().is_empty() {
+                                continue;
+                            }
+                            if let Some(normalized) = normalize_auto_tool_arg_value(value) {
+                                args.insert(key.clone(), normalized);
+                            }
+                        }
+                    }
+                    Some(AutoToolCall {
+                        tool: tool.to_string(),
+                        args,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let plugins = object
+        .get("plugins")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_object())
+                .filter_map(|call_obj| {
+                    let plugin = call_obj.get("plugin").and_then(|v| v.as_str())?;
+                    if plugin.trim().is_empty() {
+                        return None;
+                    }
+                    let command = call_obj
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "help".to_string());
+                    let mut args = BTreeMap::new();
+                    if let Some(arg_obj) = call_obj.get("args").and_then(|v| v.as_object()) {
+                        for (key, value) in arg_obj {
+                            if key.trim().is_empty() {
+                                continue;
+                            }
+                            if let Some(normalized) = normalize_auto_tool_arg_value(value) {
+                                args.insert(key.clone(), normalized);
+                            }
+                        }
+                    }
+                    Some(AutoPluginCall {
+                        plugin: plugin.to_string(),
+                        command,
+                        args,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(AutoActionPlan {
+        rationale,
+        tools,
+        plugins,
+    })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AutoPluginCall {
+    plugin: String,
+    command: String,
+    args: BTreeMap<String, String>,
+}
 async fn execute_auto_plugin_call(
     cfg: &AppConfig,
+    service: Arc<AppService>,
+    group_name: &str,
     plugin: &PluginSpec,
     command: &str,
-    args: BTreeMap<String, String>,
+    mut args: BTreeMap<String, String>,
     prompt: &str,
 ) -> Result<serde_json::Value> {
     enforce_plugin_signature_policy(cfg, plugin, false)?;
     let bridge = create_plugin_tool_bridge_session(cfg, plugin)?;
+
+    // Make code-analysis runs chat-friendly by default: keep outputs in the group directory so
+    // other channels (Telegram, CLI, etc) can later ask to "view the report" or "explain findings".
+    if plugin
+        .manifest
+        .name
+        .eq_ignore_ascii_case("code-analysis")
+        && command.eq_ignore_ascii_case("analyze")
+        && !args
+            .get("output_dir")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    {
+        let group = service
+            .store
+            .get_group_by_name(group_name)
+            .await?
+            .ok_or_else(|| anyhow!("group not found: {group_name}"))?;
+        let group_root = fs::canonicalize(&group.root_path)
+            .with_context(|| format!("failed to resolve group root {}", group.root_path))?;
+        let output_dir = group_root.join(".maid").join("code-analysis");
+        args.insert("output_dir".to_string(), output_dir.display().to_string());
+    }
 
     let mut extra_env = vec![("MAID_PLUGIN_NAME".to_string(), plugin.manifest.name.clone())];
     if let Ok(config_path) = std::env::var("MAID_CONFIG") {
@@ -3323,301 +4392,10 @@ async fn execute_auto_plugin_call(
     }))
 }
 
-async fn request_auto_plugin_plan(
-    service: Arc<AppService>,
-    group_name: &str,
-    prompt: &str,
-    enabled_plugins: &[PluginSpec],
-) -> Result<AutoPluginPlan> {
-    let plugin_catalog = enabled_plugins
-        .iter()
-        .map(|plugin| {
-            let description = plugin
-                .manifest
-                .description
-                .clone()
-                .unwrap_or_else(|| "No description".to_string());
-            let capabilities = plugin
-                .manifest
-                .capabilities
-                .clone()
-                .unwrap_or_default()
-                .join(", ");
-            format!(
-                "- {}: {} (capabilities: {})",
-                plugin.manifest.name, description, capabilities
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let planner_prompt = format!(
-        "You are a plugin planner for a local assistant.\n\
-Return ONLY JSON with this schema:\n\
-{{\"rationale\":\"short reason\",\"calls\":[{{\"plugin\":\"name\",\"command\":\"command\",\"args\":{{\"k\":\"v\"}}}}]}}\n\
-Rules:\n\
-- Use only plugins listed below.\n\
-- Choose at most 2 calls.\n\
-- If no plugin is needed, return {{\"calls\":[]}}.\n\
-- command is required; if uncertain, use \"help\".\n\
-- Keep arguments minimal and relevant to the request.\n\
-- No markdown, no comments, no extra text.\n\n\
-Group: {group_name}\n\
-User request: {prompt}\n\n\
-Available plugins:\n{plugin_catalog}\n"
-    );
-
-    let output = service
-        .model
-        .run(ModelRunRequest {
-            group_name: group_name.to_string(),
-            prompt: planner_prompt,
-            history: Vec::new(),
-        })
-        .await?
-        .output_text;
-
-    parse_auto_plugin_plan(&output)
-}
-
-fn parse_auto_plugin_plan(raw: &str) -> Result<AutoPluginPlan> {
-    let parsed = serde_json::from_str::<serde_json::Value>(raw.trim()).or_else(|_| {
-        let extracted = extract_json_object(raw)
-            .ok_or_else(|| anyhow!("auto-plugin planner did not return valid JSON"))?;
-        serde_json::from_str::<serde_json::Value>(&extracted)
-            .context("failed to parse auto-plugin planner JSON")
-    })?;
-    normalize_auto_plugin_plan(parsed)
-}
-
-fn normalize_auto_plugin_plan(value: serde_json::Value) -> Result<AutoPluginPlan> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| anyhow!("auto-plugin planner payload must be a JSON object"))?;
-    let rationale = object
-        .get("rationale")
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_string());
-
-    let mut calls = Vec::new();
-    if let Some(items) = object.get("calls").and_then(|v| v.as_array()) {
-        for item in items {
-            let Some(call_obj) = item.as_object() else {
-                continue;
-            };
-            let Some(plugin) = call_obj.get("plugin").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if plugin.trim().is_empty() {
-                continue;
-            }
-            let command = call_obj
-                .get("command")
-                .and_then(|v| v.as_str())
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "help".to_string());
-            let mut args = BTreeMap::new();
-            if let Some(arg_obj) = call_obj.get("args").and_then(|v| v.as_object()) {
-                for (key, value) in arg_obj {
-                    if key.trim().is_empty() {
-                        continue;
-                    }
-                    if let Some(normalized) = normalize_auto_tool_arg_value(value) {
-                        args.insert(key.clone(), normalized);
-                    }
-                }
-            }
-            calls.push(AutoPluginCall {
-                plugin: plugin.to_string(),
-                command,
-                args,
-            });
-        }
-    }
-
-    Ok(AutoPluginPlan { calls, rationale })
-}
-
-async fn auto_route_tools_for_prompt(
-    cfg: &AppConfig,
-    service: Arc<AppService>,
-    group_name: &str,
-    prompt: &str,
-    actor: &str,
-) -> Result<Option<String>> {
-    let allowed = cfg
-        .tool_auto_router_allowlist()
-        .into_iter()
-        .filter(|name| is_supported_plugin_tool(name))
-        .filter(|name| name != "run.prompt")
-        .collect::<Vec<_>>();
-    if allowed.is_empty() {
-        return Ok(None);
-    }
-
-    let plan = request_auto_tool_plan(service.clone(), group_name, prompt, &allowed).await?;
-    if plan.calls.is_empty() {
-        return Ok(None);
-    }
-
-    let mut rows = Vec::new();
-    for call in plan.calls.into_iter().take(3) {
-        if !allowed.iter().any(|name| name == &call.tool) {
-            continue;
-        }
-        let tool = call.tool.clone();
-        let args = call.args.clone();
-        match execute_tool_call(cfg, service.clone(), &tool, args, actor).await {
-            Ok(payload) => {
-                audit_auto_router_tool_call(
-                    service.clone(),
-                    actor,
-                    &tool,
-                    "SUCCESS",
-                    Some(json!({ "preview": tool_result_preview(&payload, 1200) })),
-                )
-                .await;
-                rows.push(json!({
-                    "tool": tool,
-                    "status": "SUCCESS",
-                    "result_preview": tool_result_preview(&payload, 1600),
-                }));
-            }
-            Err(err) => {
-                let err_text = format!("{err:#}");
-                audit_auto_router_tool_call(
-                    service.clone(),
-                    actor,
-                    &tool,
-                    "FAILED",
-                    Some(json!({ "error": err_text })),
-                )
-                .await;
-                rows.push(json!({
-                    "tool": tool,
-                    "status": "FAILED",
-                    "error": err_text,
-                }));
-            }
-        }
-    }
-
-    if rows.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(serde_json::to_string_pretty(&json!({
-        "planner_rationale": plan.rationale,
-        "calls": rows
-    }))?))
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct AutoToolPlan {
-    #[serde(default)]
-    calls: Vec<AutoToolCall>,
-    #[serde(default)]
-    rationale: Option<String>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct AutoToolCall {
     tool: String,
     args: BTreeMap<String, String>,
-}
-
-async fn request_auto_tool_plan(
-    service: Arc<AppService>,
-    group_name: &str,
-    prompt: &str,
-    allowed_tools: &[String],
-) -> Result<AutoToolPlan> {
-    let tool_catalog = allowed_tools
-        .iter()
-        .map(|name| {
-            let summary = tool_summary(name).unwrap_or("No summary available");
-            format!("- {name}: {summary}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let planner_prompt = format!(
-        "You are a tool planner for a local assistant.\n\
-Return ONLY JSON with this schema:\n\
-{{\"rationale\":\"short reason\",\"calls\":[{{\"tool\":\"name\",\"args\":{{\"k\":\"v\"}}}}]}}\n\
-Rules:\n\
-- Use only tools listed below.\n\
-- Choose at most 3 calls.\n\
-- Prefer read operations.\n\
-- If no tool is needed, return {{\"calls\":[]}}.\n\
-- No markdown, no comments, no extra text.\n\n\
-Group: {group_name}\n\
-User request: {prompt}\n\n\
-Available tools:\n{tool_catalog}\n"
-    );
-
-    let output = service
-        .model
-        .run(ModelRunRequest {
-            group_name: group_name.to_string(),
-            prompt: planner_prompt,
-            history: Vec::new(),
-        })
-        .await?
-        .output_text;
-
-    parse_auto_tool_plan(&output)
-}
-
-fn parse_auto_tool_plan(raw: &str) -> Result<AutoToolPlan> {
-    let parsed = serde_json::from_str::<serde_json::Value>(raw.trim()).or_else(|_| {
-        let extracted = extract_json_object(raw)
-            .ok_or_else(|| anyhow!("auto-router planner did not return valid JSON"))?;
-        serde_json::from_str::<serde_json::Value>(&extracted)
-            .context("failed to parse auto-router planner JSON")
-    })?;
-    normalize_auto_tool_plan(parsed)
-}
-
-fn normalize_auto_tool_plan(value: serde_json::Value) -> Result<AutoToolPlan> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| anyhow!("auto-router planner payload must be a JSON object"))?;
-    let rationale = object
-        .get("rationale")
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_string());
-
-    let mut calls = Vec::new();
-    if let Some(items) = object.get("calls").and_then(|v| v.as_array()) {
-        for item in items {
-            let Some(call_obj) = item.as_object() else {
-                continue;
-            };
-            let Some(tool) = call_obj.get("tool").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if tool.trim().is_empty() {
-                continue;
-            }
-            let mut args = BTreeMap::new();
-            if let Some(arg_obj) = call_obj.get("args").and_then(|v| v.as_object()) {
-                for (key, value) in arg_obj {
-                    if key.trim().is_empty() {
-                        continue;
-                    }
-                    if let Some(normalized) = normalize_auto_tool_arg_value(value) {
-                        args.insert(key.clone(), normalized);
-                    }
-                }
-            }
-            calls.push(AutoToolCall {
-                tool: tool.to_string(),
-                args,
-            });
-        }
-    }
-
-    Ok(AutoToolPlan { calls, rationale })
 }
 
 fn normalize_auto_tool_arg_value(value: &serde_json::Value) -> Option<String> {
@@ -3898,6 +4676,8 @@ fn supported_tool_names() -> &'static [&'static str] {
         "ops.web_fetch",
         "ops.search",
         "ops.grep",
+        "ops.code_analysis.latest",
+        "ops.code_analysis.list",
     ]
 }
 
@@ -3921,6 +4701,10 @@ fn tool_summary(name: &str) -> Option<&'static str> {
         "ops.web_fetch" => Some("Fetch URL; args: url,[timeout_seconds],[max_bytes]"),
         "ops.search" => Some("Web search; args: query,[limit],[timeout_seconds]"),
         "ops.grep" => Some("Search files in group root; args: group,pattern,[path],[ignore_case]"),
+        "ops.code_analysis.latest" => Some(
+            "Get latest code-analysis workflow + top findings; args: group,[workflow_id],[top_n],[include_markdown],[max_chars]",
+        ),
+        "ops.code_analysis.list" => Some("List recent code-analysis workflows; args: group,[limit]"),
         _ => None,
     }
 }
@@ -3993,6 +4777,26 @@ fn parent_or_current(path: &str) -> Result<&Path> {
     Path::new(path)
         .parent()
         .ok_or_else(|| anyhow!("invalid path: {path}"))
+}
+
+fn load_dotenv_file(path: &Path) {
+    match dotenvy::from_path(path) {
+        Ok(_) => info!("loaded environment file {}", path.display()),
+        Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => warn!("failed to load environment file {}: {err}", path.display()),
+    }
+}
+
+fn apply_config_path_from_env(cli: &mut Cli) {
+    if cli.config.exists() {
+        return;
+    }
+    if let Ok(from_env) = std::env::var("MAID_CONFIG") {
+        let from_env_path = PathBuf::from(from_env);
+        if from_env_path.exists() {
+            cli.config = from_env_path;
+        }
+    }
 }
 
 fn build_model_provider(cfg: &AppConfig) -> Result<Arc<dyn ModelProvider>> {
@@ -4870,23 +5674,24 @@ async fn run_onboard(
     }
     println!();
     println!("guided next steps:");
+    println!("1) set credentials in .env (preferred) or export them in your shell");
     println!(
-        "1) export {}=<your_key>",
+        "   model key env: {}",
         model_envs
             .first()
             .cloned()
             .unwrap_or_else(|| "OPENAI_API_KEY".to_string())
     );
     if let Some(telegram) = &cfg.telegram {
-        println!("2) export {}=<telegram_bot_token>", telegram.bot_token_env);
+        println!("   telegram key env: {}", telegram.bot_token_env);
     } else {
-        println!("2) optional: configure [telegram] in config.toml");
+        println!("   telegram: optional, configure [telegram] in config.toml");
     }
-    println!("3) cargo run -p maid -- doctor");
-    println!("4) cargo run -p maid -- gateway --port 18789");
-    println!("5) cargo run -p maid -- group create work");
-    println!("6) cargo run -p maid -- task wizard");
-    println!("7) cargo run -p maid -- dashboard --port 18790");
+    println!("2) cargo run -p maid -- doctor");
+    println!("3) cargo run -p maid -- gateway --port 18789");
+    println!("4) cargo run -p maid -- group create work");
+    println!("5) cargo run -p maid -- task wizard");
+    println!("6) cargo run -p maid -- dashboard --port 18790");
 
     if interactive {
         if !io::stdin().is_terminal() {
@@ -5054,14 +5859,14 @@ provider = "openai"
 api_key_env = "OPENAI_API_KEY"
 api_key_envs = ["OPENAI_API_KEY"]
 base_url = "https://api.openai.com/v1"
-model = "gpt-4.1-mini"
-fallback_models = ["gpt-4o-mini"]
+model = "gpt-5.2"
+fallback_models = ["gpt-5-mini", "gpt-4.1-mini"]
 # active_profile = "primary"
 # [model.profiles.primary]
 # provider = "openai"
 # api_key_envs = ["OPENAI_API_KEY"]
-# model = "gpt-5-mini"
-# fallback_models = ["gpt-4.1-mini"]
+# model = "gpt-5.2"
+# fallback_models = ["gpt-5-mini", "gpt-4.1-mini"]
 # [model.ops]
 # max_retries = 2
 # retry_backoff_ms = 800
@@ -5128,8 +5933,8 @@ provider = "openai"
 api_key_env = "OPENAI_API_KEY"
 api_key_envs = ["OPENAI_API_KEY"]
 base_url = "https://api.openai.com/v1"
-model = "gpt-4.1-mini"
-fallback_models = ["gpt-4o-mini"]
+model = "gpt-5.2"
+fallback_models = ["gpt-5-mini", "gpt-4.1-mini"]
 
 [scheduler]
 tick_seconds = 30
@@ -5152,7 +5957,7 @@ validate_on_startup = true
 
 [tools]
 auto_router_enabled = true
-auto_router_allowlist = ["ops.web_fetch", "ops.search", "ops.grep", "task.list", "group.list"]
+auto_router_allowlist = ["ops.web_fetch", "ops.search", "ops.grep", "ops.code_analysis.latest", "ops.code_analysis.list", "task.list", "group.list"]
 
 [policy]
 allow_job_tasks = false
@@ -5170,8 +5975,8 @@ provider = "openai"
 api_key_env = "OPENAI_API_KEY"
 api_key_envs = ["OPENAI_API_KEY"]
 base_url = "https://api.openai.com/v1"
-model = "gpt-4.1-mini"
-fallback_models = ["gpt-4o-mini"]
+model = "gpt-5.2"
+fallback_models = ["gpt-5-mini", "gpt-4.1-mini"]
 
 [scheduler]
 tick_seconds = 30
@@ -5197,7 +6002,7 @@ trusted_keys = {}
 
 [tools]
 auto_router_enabled = true
-auto_router_allowlist = ["ops.web_fetch", "ops.search", "ops.grep", "task.list", "group.list"]
+auto_router_allowlist = ["ops.web_fetch", "ops.search", "ops.grep", "ops.code_analysis.latest", "ops.code_analysis.list", "task.list", "group.list"]
 
 [policy]
 allow_job_tasks = false
@@ -5230,13 +6035,16 @@ fn remediation_hint(err: &anyhow::Error) -> Option<String> {
         );
     }
     if text.contains("missing openai api key") || text.contains("credentials missing") {
-        return Some("export OPENAI_API_KEY=... then retry (or run `maid doctor`)".to_string());
+        return Some(
+            "set OPENAI_API_KEY in .env (or export it) then retry (or run `maid doctor`)"
+                .to_string(),
+        );
     }
     if text.contains("plugin") && text.contains("disabled") {
         return Some("enable it in config or run: maid plugin enable --name <plugin>".to_string());
     }
     if text.contains("telegram") && text.contains("env") {
-        return Some("export TELEGRAM_BOT_TOKEN=... then retry".to_string());
+        return Some("set TELEGRAM_BOT_TOKEN in .env (or export it) then retry".to_string());
     }
     if text.contains("config already exists") {
         return Some("re-run with --force if you want to overwrite the file".to_string());
@@ -5327,41 +6135,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_auto_tool_plan_coerces_non_string_args() {
+    fn parse_auto_action_plan_coerces_non_string_args() {
         let raw = r#"{
-            "rationale":"need tools",
-            "calls":[
-                {"tool":"ops.search","args":{"query":"rust sqlite","limit":3}},
-                {"tool":"ops.grep","args":{"group":"smoke","ignore_case":true}}
+            "rationale":"mix tools and plugins",
+            "tools":[
+                {"tool":"ops.search","args":{"query":"rust sqlite","limit":3}}
+            ],
+            "plugins":[
+                {"plugin":"code-analysis","command":"analyze","args":{"repo_path":"/tmp/repo","depth":2}}
             ]
         }"#;
-        let parsed = parse_auto_tool_plan(raw).unwrap();
-        assert_eq!(parsed.calls.len(), 2);
+        let parsed = parse_auto_action_plan(raw).unwrap();
+        assert_eq!(parsed.tools.len(), 1);
+        assert_eq!(parsed.plugins.len(), 1);
         assert_eq!(
-            parsed.calls[0].args.get("limit").map(String::as_str),
+            parsed.tools[0].args.get("limit").map(String::as_str),
             Some("3")
         );
         assert_eq!(
-            parsed.calls[1].args.get("ignore_case").map(String::as_str),
-            Some("true")
-        );
-    }
-
-    #[test]
-    fn parse_auto_plugin_plan_coerces_non_string_args() {
-        let raw = r#"{
-            "rationale":"run code analysis",
-            "calls":[
-                {"plugin":"code-analysis","command":"analyze","args":{"repo_path":"/tmp/repo","max_findings":20}}
-            ]
-        }"#;
-        let parsed = parse_auto_plugin_plan(raw).unwrap();
-        assert_eq!(parsed.calls.len(), 1);
-        assert_eq!(parsed.calls[0].plugin, "code-analysis");
-        assert_eq!(parsed.calls[0].command, "analyze");
-        assert_eq!(
-            parsed.calls[0].args.get("max_findings").map(String::as_str),
-            Some("20")
+            parsed.plugins[0].args.get("depth").map(String::as_str),
+            Some("2")
         );
     }
 
