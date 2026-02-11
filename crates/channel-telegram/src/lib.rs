@@ -53,6 +53,7 @@ pub trait TelegramCommandHandler: Send + Sync {
         prompt: &str,
     ) -> Result<String>;
     async fn list_tasks(&self, group_name: &str) -> Result<Vec<TelegramTask>>;
+    async fn delete_task(&self, task_id: &str) -> Result<bool>;
     async fn pause_task(&self, task_id: &str) -> Result<()>;
     async fn resume_task(&self, task_id: &str) -> Result<()>;
     async fn run_task_now(&self, task_id: &str) -> Result<String>;
@@ -225,6 +226,15 @@ impl TelegramBot {
                     format_task_list(tasks)
                 }
             }
+            "/task_delete" => {
+                if args.is_empty() {
+                    "Usage: /task_delete <task_id>".to_string()
+                } else if handler.delete_task(args).await? {
+                    format!("Deleted task {args}")
+                } else {
+                    format!("Task not found: {args}")
+                }
+            }
             "/task_pause" => {
                 if args.is_empty() {
                     "Usage: /task_pause <task_id>".to_string()
@@ -330,7 +340,9 @@ impl TelegramBot {
             .copied()
             .unwrap_or(self.activation_mode);
         let mention_hint = match activation_mode {
-            TelegramActivationMode::Always => "Chat activation: always-on in this chat.".to_string(),
+            TelegramActivationMode::Always => {
+                "Chat activation: always-on (any message is treated as a prompt).".to_string()
+            }
             TelegramActivationMode::Mention => {
                 let token = self
                     .per_chat_mention_token
@@ -338,34 +350,41 @@ impl TelegramBot {
                     .map(|token| token.as_str())
                     .or(self.mention_token.as_deref())
                     .unwrap_or("@maid");
-                format!("Chat activation: mention required (prefix messages with '{token}').")
+                format!("Chat activation: mention required (prefix prompts with '{token} ').")
             }
         };
         let dm_policy = match self.dm_policy {
             TelegramDmPolicy::Open => "DM policy: open".to_string(),
-            TelegramDmPolicy::Pairing => {
-                "DM policy: pairing required for unknown chats (/pair <code>)".to_string()
-            }
+            TelegramDmPolicy::Pairing => "DM policy: pairing required for unknown chats".to_string(),
         };
 
         [
-            "maid telegram quick help",
+            "maid telegram help",
             &mention_hint,
             &dm_policy,
             "",
             "Commands:",
-            "/run <prompt>",
-            "/task_create <name>|<rrule>|<prompt>",
-            "/task_list",
-            "/task_pause <task_id>",
-            "/task_resume <task_id>",
-            "/task_run <task_id>",
-            "/pair <code>",
+            "/help - show this message",
+            "/start - same as /help",
+            "/run <prompt> - run a one-off prompt",
+            "/task_create <name>|<rrule>|<prompt> - create a scheduled task",
+            "/task_list - list tasks for this chat",
+            "/task_delete <task_id> - delete a task",
+            "/task_pause <task_id> - pause a task",
+            "/task_resume <task_id> - resume a task",
+            "/task_run <task_id> - run a task immediately",
+            "/pair <code> - approve a pairing code (typically from the main/admin chat)",
             "",
             "Examples:",
             "/run summarize my open tasks",
-            "/task_create hourly-check|FREQ=MINUTELY;INTERVAL=15|Send me a short check-in",
-            "Any non-command message is treated as a prompt when activation rules match.",
+            "/task_create checkin|every 15 minutes|Send me a short check-in",
+            "/task_create checkin|FREQ=MINUTELY;INTERVAL=15|Send me a short check-in",
+            "/task_create weekday-brief|FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0|Daily brief",
+            "",
+            "Notes:",
+            "Schedule can be an RRULE (FREQ=...) or a simple phrase like 'every 15 minutes' or 'every weekday at 9am'.",
+            "When activation is mention-required, non-command prompts must start with the mention token.",
+            "If pairing is enabled, new chats will be shown a code; approve it via CLI (maid pairing approve --code <code>) or from the main/admin chat via /pair <code>.",
         ]
         .join("\n")
     }

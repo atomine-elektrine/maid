@@ -406,11 +406,14 @@ impl TelegramCommandHandler for TelegramServiceAdapter {
         schedule: &str,
         prompt: &str,
     ) -> Result<String> {
-        Schedule::parse_rrule(schedule)
-            .with_context(|| format!("invalid schedule RRULE: {schedule}"))?;
+        // Keep Telegram UX closer to CLI: accept either an RRULE or a small set of human phrases
+        // (e.g. "every 15 minutes") and normalize to RRULE before validation/storage.
+        let schedule_rrule = schedule_from_human_or_rrule(schedule)?;
+        Schedule::parse_rrule(&schedule_rrule)
+            .with_context(|| format!("invalid schedule RRULE: {schedule_rrule}"))?;
         let task = self
             .service
-            .create_task(group_name, name, schedule, prompt, "telegram")
+            .create_task(group_name, name, &schedule_rrule, prompt, "telegram")
             .await?;
         Ok(task.id)
     }
@@ -426,6 +429,10 @@ impl TelegramCommandHandler for TelegramServiceAdapter {
                 schedule: task.schedule_rrule,
             })
             .collect())
+    }
+
+    async fn delete_task(&self, task_id: &str) -> Result<bool> {
+        self.service.delete_task(task_id, "telegram").await
     }
 
     async fn pause_task(&self, task_id: &str) -> Result<()> {
