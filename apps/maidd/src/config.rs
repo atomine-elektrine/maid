@@ -79,12 +79,19 @@ pub struct PluginsConfig {
     pub tool_max_calls_per_minute: Option<u32>,
     pub validate_on_startup: Option<bool>,
     pub signing: Option<PluginSigningConfig>,
+    pub trust: Option<PluginTrustConfig>,
+    pub routing: Option<PluginRoutingConfig>,
     pub registry: Option<PluginRegistryConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SkillsConfig {
     pub enabled: Option<Vec<String>>,
+    pub allow_unlisted: Option<bool>,
+    pub registry_enabled: Option<bool>,
+    pub registry_path: Option<String>,
+    pub max_candidates: Option<usize>,
+    pub max_invocations: Option<usize>,
     pub max_context_chars: Option<usize>,
     pub recent_message_limit: Option<i64>,
     pub task_limit: Option<usize>,
@@ -99,6 +106,34 @@ pub struct PluginSigningConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PluginRegistryConfig {
     pub index_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginTrustConfig {
+    pub require_signatures: Option<bool>,
+    pub trusted_publishers: Option<Vec<String>>,
+    pub allow_unsigned_local: Option<bool>,
+    pub quarantine_untrusted: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginRoutingConfig {
+    pub enabled: Option<bool>,
+    pub intent_rules: Option<Vec<PluginIntentRuleConfig>>,
+    pub pinned: Option<Vec<PluginPinnedCapabilityConfig>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginIntentRuleConfig {
+    pub pattern: String,
+    pub plugin: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginPinnedCapabilityConfig {
+    pub capability: String,
+    pub plugin: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -349,6 +384,62 @@ impl AppConfig {
                     ));
                 }
             }
+            if let Some(trust) = &plugins.trust {
+                if let Some(publishers) = &trust.trusted_publishers {
+                    let mut seen = std::collections::HashSet::new();
+                    for publisher in publishers {
+                        validate_publisher_name(publisher)?;
+                        if !seen.insert(publisher) {
+                            return Err(anyhow!(
+                                "plugins.trust.trusted_publishers contains duplicate value: {publisher}"
+                            ));
+                        }
+                    }
+                }
+                if trust.require_signatures.unwrap_or(false)
+                    && plugins
+                        .signing
+                        .as_ref()
+                        .and_then(|signing| signing.trusted_keys.as_ref())
+                        .map(|keys| keys.is_empty())
+                        .unwrap_or(true)
+                    && !trust.allow_unsigned_local.unwrap_or(true)
+                {
+                    return Err(anyhow!(
+                        "plugins.trust.require_signatures=true requires plugins.signing.trusted_keys unless allow_unsigned_local=true"
+                    ));
+                }
+            }
+            if let Some(routing) = &plugins.routing {
+                if let Some(intent_rules) = &routing.intent_rules {
+                    for rule in intent_rules {
+                        if rule.pattern.trim().is_empty() {
+                            return Err(anyhow!(
+                                "plugins.routing.intent_rules pattern must not be empty"
+                            ));
+                        }
+                        validate_plugin_name(&rule.plugin)?;
+                        if rule.command.trim().is_empty() {
+                            return Err(anyhow!(
+                                "plugins.routing.intent_rules command must not be empty"
+                            ));
+                        }
+                    }
+                }
+                if let Some(pins) = &routing.pinned {
+                    let mut seen = std::collections::HashSet::new();
+                    for pin in pins {
+                        validate_capability_name(&pin.capability)?;
+                        validate_plugin_name(&pin.plugin)?;
+                        if !seen.insert(&pin.capability) {
+                            return Err(anyhow!(
+                                "plugins.routing.pinned contains duplicate capability: {}",
+                                pin.capability
+                            ));
+                        }
+                    }
+                }
+            }
         }
         if let Some(skills) = &self.skills {
             if let Some(enabled) = &skills.enabled {
@@ -360,6 +451,25 @@ impl AppConfig {
                             "skills.enabled contains duplicate skill name: {name}"
                         ));
                     }
+                }
+            }
+            if let Some(path) = &skills.registry_path {
+                if path.trim().is_empty() {
+                    return Err(anyhow!("skills.registry_path must not be empty when set"));
+                }
+            }
+            if let Some(limit) = skills.max_candidates {
+                if limit == 0 || limit > 10_000 {
+                    return Err(anyhow!(
+                        "skills.max_candidates must be between 1 and 10000 when set"
+                    ));
+                }
+            }
+            if let Some(limit) = skills.max_invocations {
+                if limit == 0 || limit > 100 {
+                    return Err(anyhow!(
+                        "skills.max_invocations must be between 1 and 100 when set"
+                    ));
                 }
             }
             if let Some(max_chars) = skills.max_context_chars {
@@ -471,7 +581,7 @@ impl AppConfig {
             }
             if !self.plugin_require_signatures() {
                 return Err(anyhow!(
-                    "production mode requires plugins.signing.require_signatures=true"
+                    "production mode requires plugin signature enforcement"
                 ));
             }
         }
@@ -489,6 +599,41 @@ impl AppConfig {
                     "group.profile".to_string(),
                 ]
             })
+    }
+
+    pub fn skill_allow_unlisted(&self) -> bool {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.allow_unlisted)
+            .unwrap_or(false)
+    }
+
+    pub fn skill_registry_enabled(&self) -> bool {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.registry_enabled)
+            .unwrap_or(true)
+    }
+
+    pub fn skill_registry_path(&self) -> String {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.registry_path.clone())
+            .unwrap_or_else(|| "skills/registry.toml".to_string())
+    }
+
+    pub fn skill_max_candidates(&self) -> usize {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.max_candidates)
+            .unwrap_or(64)
+    }
+
+    pub fn skill_max_invocations(&self) -> usize {
+        self.skills
+            .as_ref()
+            .and_then(|skills| skills.max_invocations)
+            .unwrap_or(5)
     }
 
     pub fn skill_max_context_chars(&self) -> usize {
@@ -577,11 +722,19 @@ impl AppConfig {
         if self.is_production() {
             return true;
         }
-        self.plugins
+        let signing = self
+            .plugins
             .as_ref()
             .and_then(|plugins| plugins.signing.as_ref())
             .and_then(|signing| signing.require_signatures)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        let trust = self
+            .plugins
+            .as_ref()
+            .and_then(|plugins| plugins.trust.as_ref())
+            .and_then(|trust| trust.require_signatures)
+            .unwrap_or(false);
+        signing || trust
     }
 
     pub fn plugin_trusted_signing_keys(&self) -> BTreeMap<String, String> {
@@ -589,6 +742,54 @@ impl AppConfig {
             .as_ref()
             .and_then(|plugins| plugins.signing.as_ref())
             .and_then(|signing| signing.trusted_keys.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn plugin_trusted_publishers(&self) -> Vec<String> {
+        self.plugins
+            .as_ref()
+            .and_then(|plugins| plugins.trust.as_ref())
+            .and_then(|trust| trust.trusted_publishers.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn plugin_allow_unsigned_local(&self) -> bool {
+        self.plugins
+            .as_ref()
+            .and_then(|plugins| plugins.trust.as_ref())
+            .and_then(|trust| trust.allow_unsigned_local)
+            .unwrap_or(true)
+    }
+
+    pub fn plugin_quarantine_untrusted(&self) -> bool {
+        self.plugins
+            .as_ref()
+            .and_then(|plugins| plugins.trust.as_ref())
+            .and_then(|trust| trust.quarantine_untrusted)
+            .unwrap_or(false)
+    }
+
+    pub fn plugin_routing_enabled(&self) -> bool {
+        self.plugins
+            .as_ref()
+            .and_then(|plugins| plugins.routing.as_ref())
+            .and_then(|routing| routing.enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn plugin_routing_intent_rules(&self) -> Vec<PluginIntentRuleConfig> {
+        self.plugins
+            .as_ref()
+            .and_then(|plugins| plugins.routing.as_ref())
+            .and_then(|routing| routing.intent_rules.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn plugin_routing_pins(&self) -> Vec<PluginPinnedCapabilityConfig> {
+        self.plugins
+            .as_ref()
+            .and_then(|plugins| plugins.routing.as_ref())
+            .and_then(|routing| routing.pinned.clone())
             .unwrap_or_default()
     }
 
@@ -925,6 +1126,36 @@ fn validate_tool_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_capability_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(anyhow!("capability name must not be empty"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_')
+    {
+        return Err(anyhow!(
+            "capability name must contain only lowercase letters, digits, dots, underscores, and hyphens"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_publisher_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(anyhow!("publisher name must not be empty"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_')
+    {
+        return Err(anyhow!(
+            "publisher name must contain only lowercase letters, digits, dots, underscores, and hyphens"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_signing_key_id(name: &str) -> Result<()> {
     if name.trim().is_empty() {
         return Err(anyhow!("signing key id must not be empty"));
@@ -975,6 +1206,11 @@ mod tests {
 
         [skills]
         enabled = ["memory.recent", "tasks.snapshot"]
+        allow_unlisted = false
+        registry_enabled = true
+        registry_path = "skills/registry.toml"
+        max_candidates = 128
+        max_invocations = 5
         max_context_chars = 3000
         recent_message_limit = 6
         task_limit = 10
@@ -989,6 +1225,16 @@ mod tests {
         [plugins.signing]
         require_signatures = false
         trusted_keys = { "local.dev" = "BASE64_PUBLIC_KEY" }
+
+        [plugins.trust]
+        trusted_publishers = ["maid-official", "acme-security"]
+        allow_unsigned_local = true
+        quarantine_untrusted = true
+
+        [plugins.routing]
+        enabled = true
+        intent_rules = [{ pattern = "(?i)convert.*spl.*kql", plugin = "siem-convert", command = "convert" }]
+        pinned = [{ capability = "siem.query.convert.ai", plugin = "siem-convert" }]
 
         [tools]
         web_fetch_timeout_seconds = 20
@@ -1016,6 +1262,12 @@ mod tests {
         assert_eq!(parsed.plugin_tool_max_calls_per_minute(), 30);
         assert!(!parsed.plugin_require_signatures());
         assert_eq!(parsed.plugin_trusted_signing_keys().len(), 1);
+        assert_eq!(parsed.plugin_trusted_publishers().len(), 2);
+        assert!(parsed.plugin_allow_unsigned_local());
+        assert!(parsed.plugin_quarantine_untrusted());
+        assert!(parsed.plugin_routing_enabled());
+        assert_eq!(parsed.plugin_routing_intent_rules().len(), 1);
+        assert_eq!(parsed.plugin_routing_pins().len(), 1);
         assert_eq!(parsed.model_api_key_envs().len(), 2);
         assert_eq!(parsed.model_candidates().len(), 2);
         assert_eq!(parsed.telegram_dm_policy(), "pairing");
@@ -1023,11 +1275,13 @@ mod tests {
         assert_eq!(parsed.telegram_mention_token(), Some("@maid"));
         assert_eq!(
             parsed.enabled_skills(),
-            vec![
-                "memory.recent".to_string(),
-                "tasks.snapshot".to_string()
-            ]
+            vec!["memory.recent".to_string(), "tasks.snapshot".to_string()]
         );
+        assert!(!parsed.skill_allow_unlisted());
+        assert!(parsed.skill_registry_enabled());
+        assert_eq!(parsed.skill_registry_path(), "skills/registry.toml");
+        assert_eq!(parsed.skill_max_candidates(), 128);
+        assert_eq!(parsed.skill_max_invocations(), 5);
         assert_eq!(parsed.skill_max_context_chars(), 3000);
         assert_eq!(parsed.skill_recent_message_limit(), 6);
         assert_eq!(parsed.skill_task_limit(), 10);
@@ -1233,6 +1487,12 @@ mod tests {
         assert_eq!(parsed.plugin_tool_max_calls_per_minute(), 60);
         assert!(!parsed.plugin_require_signatures());
         assert!(parsed.plugin_trusted_signing_keys().is_empty());
+        assert!(parsed.plugin_trusted_publishers().is_empty());
+        assert!(parsed.plugin_allow_unsigned_local());
+        assert!(!parsed.plugin_quarantine_untrusted());
+        assert!(!parsed.plugin_routing_enabled());
+        assert!(parsed.plugin_routing_intent_rules().is_empty());
+        assert!(parsed.plugin_routing_pins().is_empty());
         assert_eq!(parsed.tool_web_fetch_timeout_seconds(), 15);
         assert_eq!(parsed.tool_web_fetch_max_bytes(), 131_072);
         assert!(parsed.tool_web_fetch_allowed_domains().is_empty());
@@ -1248,6 +1508,11 @@ mod tests {
                 "group.profile".to_string()
             ]
         );
+        assert!(!parsed.skill_allow_unlisted());
+        assert!(parsed.skill_registry_enabled());
+        assert_eq!(parsed.skill_registry_path(), "skills/registry.toml");
+        assert_eq!(parsed.skill_max_candidates(), 64);
+        assert_eq!(parsed.skill_max_invocations(), 5);
         assert_eq!(parsed.skill_max_context_chars(), 4000);
         assert_eq!(parsed.skill_recent_message_limit(), 8);
         assert_eq!(parsed.skill_task_limit(), 12);
@@ -1324,6 +1589,53 @@ mod tests {
     }
 
     #[test]
+    fn reject_invalid_trusted_publisher() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [plugins.trust]
+        trusted_publishers = ["Bad Publisher"]
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_plugin_routing_pin() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [plugins.routing]
+        enabled = true
+        pinned = [{ capability = "Bad Capability", plugin = "echo" }]
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
     fn reject_invalid_tools_limits() {
         let raw = r#"
         database_path = "data/assistant.db"
@@ -1363,6 +1675,29 @@ mod tests {
 
         [skills]
         enabled = ["Memory.Recent", "memory.recent"]
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_skill_registry_limits() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [skills]
+        max_candidates = 0
         "#;
 
         let parsed: AppConfig = toml::from_str(raw).unwrap();

@@ -355,7 +355,9 @@ impl TelegramBot {
         };
         let dm_policy = match self.dm_policy {
             TelegramDmPolicy::Open => "DM policy: open".to_string(),
-            TelegramDmPolicy::Pairing => "DM policy: pairing required for unknown chats".to_string(),
+            TelegramDmPolicy::Pairing => {
+                "DM policy: pairing required for unknown chats".to_string()
+            }
         };
 
         [

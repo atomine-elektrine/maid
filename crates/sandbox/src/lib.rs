@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -14,7 +14,15 @@ pub enum RuntimeKind {
 }
 
 impl RuntimeKind {
-    pub fn from_str(value: &str) -> Result<Self> {
+    pub fn parse(value: &str) -> Result<Self> {
+        Self::from_str(value)
+    }
+}
+
+impl FromStr for RuntimeKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
         match value {
             "apple_container" => Ok(Self::AppleContainer),
             "docker" => Ok(Self::Docker),
@@ -166,7 +174,7 @@ fn validate_spec(spec: &SandboxJobSpec) -> Result<()> {
         )
     })?;
 
-    if canonical == PathBuf::from("/") {
+    if canonical.as_path() == std::path::Path::new("/") {
         return Err(anyhow!("group root cannot be host root '/'"));
     }
 

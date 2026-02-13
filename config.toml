@@ -6,7 +6,10 @@ runtime = "apple_container"
 api_key_env = "OPENAI_API_KEY"
 api_key_envs = ["OPENAI_API_KEY"]
 base_url = "https://api.openai.com/v1"
-fallback_models = ["gpt-5-mini", "gpt-4.1-mini"]
+fallback_models = [
+    "gpt-5-mini",
+    "gpt-4.1-mini",
+]
 model = "gpt-5.2"
 provider = "openai"
 
@@ -14,7 +17,7 @@ provider = "openai"
 directory = "plugins"
 enabled = [
     "code-analysis",
-    "echo",
+    "siem-convert",
 ]
 validate_on_startup = true
 

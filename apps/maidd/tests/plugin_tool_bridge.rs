@@ -76,7 +76,10 @@ allowed_tools = ["group.create"]
 timeout_seconds = 30
 env_allowlist = []
 "#;
-    write_file(&plugin_root.join("plugin.toml"), plugin_manifest.trim_start());
+    write_file(
+        &plugin_root.join("plugin.toml"),
+        plugin_manifest.trim_start(),
+    );
 
     let plugin_script = r#"#!/usr/bin/env bash
 set -euo pipefail

@@ -11,18 +11,47 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
+    pub schema_version: Option<u32>,
     pub name: String,
     pub version: String,
+    pub display_name: Option<String>,
     pub description: Option<String>,
+    pub license: Option<String>,
+    pub homepage: Option<String>,
+    pub repository: Option<String>,
+    pub publisher: Option<String>,
+    pub maintainers: Option<Vec<String>>,
     pub executable: String,
+    pub categories: Option<Vec<String>>,
+    pub tags: Option<Vec<String>>,
+    pub keywords: Option<Vec<String>>,
     pub capabilities: Option<Vec<String>>,
+    pub min_maid_version: Option<String>,
+    pub api_version: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
+    pub compatibility: Option<PluginCompatibility>,
+    pub update_channel: Option<String>,
+    pub routing: Option<PluginRouting>,
     pub timeout_seconds: Option<u64>,
     pub env_allowlist: Option<Vec<String>>,
     pub signing_key_id: Option<String>,
     pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginCompatibility {
+    pub maid: Option<String>,
+    pub plugin_api: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginRouting {
+    pub intents: Option<Vec<String>>,
+    pub examples: Option<Vec<String>>,
+    pub confidence_floor: Option<f64>,
+    pub priority: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -314,8 +343,12 @@ pub fn write_plugin_signature(manifest_path: &Path, key_id: &str, signature: &st
 
     let raw = std::fs::read_to_string(manifest_path)
         .with_context(|| format!("failed to read plugin manifest {}", manifest_path.display()))?;
-    let mut value: toml::Value = toml::from_str(&raw)
-        .with_context(|| format!("failed to parse plugin manifest {}", manifest_path.display()))?;
+    let mut value: toml::Value = toml::from_str(&raw).with_context(|| {
+        format!(
+            "failed to parse plugin manifest {}",
+            manifest_path.display()
+        )
+    })?;
     let table = value
         .as_table_mut()
         .ok_or_else(|| anyhow!("plugin manifest must be a TOML table"))?;
@@ -333,8 +366,12 @@ pub fn write_plugin_signature(manifest_path: &Path, key_id: &str, signature: &st
             manifest_path.display()
         )
     })?;
-    std::fs::write(manifest_path, formatted)
-        .with_context(|| format!("failed to write plugin manifest {}", manifest_path.display()))?;
+    std::fs::write(manifest_path, formatted).with_context(|| {
+        format!(
+            "failed to write plugin manifest {}",
+            manifest_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -346,15 +383,22 @@ fn load_plugin_spec(plugin_dir: &Path) -> Result<PluginSpec> {
         ));
     }
 
-    let root_dir = plugin_dir
-        .canonicalize()
-        .with_context(|| format!("failed to resolve plugin directory {}", plugin_dir.display()))?;
+    let root_dir = plugin_dir.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve plugin directory {}",
+            plugin_dir.display()
+        )
+    })?;
     let manifest_path = root_dir.join("plugin.toml");
 
     let raw = std::fs::read_to_string(&manifest_path)
         .with_context(|| format!("failed to read plugin manifest {}", manifest_path.display()))?;
-    let manifest = toml::from_str::<PluginManifest>(&raw)
-        .with_context(|| format!("failed to parse plugin manifest {}", manifest_path.display()))?;
+    let manifest = toml::from_str::<PluginManifest>(&raw).with_context(|| {
+        format!(
+            "failed to parse plugin manifest {}",
+            manifest_path.display()
+        )
+    })?;
 
     validate_manifest(&manifest)?;
 
@@ -422,8 +466,59 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<()> {
     if manifest.executable.trim().is_empty() {
         return Err(anyhow!("plugin executable must not be empty"));
     }
+    if let Some(schema_version) = manifest.schema_version {
+        if schema_version == 0 {
+            return Err(anyhow!("plugin schema_version must be >= 1"));
+        }
+    }
+    validate_non_empty_string_list("plugin maintainers", &manifest.maintainers)?;
+    validate_non_empty_string_list("plugin categories", &manifest.categories)?;
+    validate_non_empty_string_list("plugin tags", &manifest.tags)?;
+    validate_non_empty_string_list("plugin keywords", &manifest.keywords)?;
+    validate_non_empty_string_list("plugin capabilities", &manifest.capabilities)?;
+    validate_non_empty_string_list("plugin env_allowlist", &manifest.env_allowlist)?;
     for tool in manifest.allowed_tools.clone().unwrap_or_default() {
         validate_tool_name(&tool)?;
+    }
+    if let Some(channel) = &manifest.update_channel {
+        if !matches!(channel.as_str(), "stable" | "beta" | "edge") {
+            return Err(anyhow!(
+                "plugin update_channel must be one of: stable, beta, edge"
+            ));
+        }
+    }
+    if let Some(compatibility) = &manifest.compatibility {
+        if compatibility
+            .maid
+            .as_ref()
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return Err(anyhow!(
+                "plugin compatibility.maid must not be empty when set"
+            ));
+        }
+        if compatibility
+            .plugin_api
+            .as_ref()
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return Err(anyhow!(
+                "plugin compatibility.plugin_api must not be empty when set"
+            ));
+        }
+    }
+    if let Some(routing) = &manifest.routing {
+        validate_non_empty_string_list("plugin routing.intents", &routing.intents)?;
+        validate_non_empty_string_list("plugin routing.examples", &routing.examples)?;
+        if let Some(floor) = routing.confidence_floor {
+            if !(0.0..=1.0).contains(&floor) {
+                return Err(anyhow!(
+                    "plugin routing.confidence_floor must be between 0.0 and 1.0"
+                ));
+            }
+        }
     }
     match (
         manifest.signing_key_id.as_deref(),
@@ -440,6 +535,17 @@ fn validate_manifest(manifest: &PluginManifest) -> Result<()> {
             return Err(anyhow!(
                 "plugin signing fields must include both signing_key_id and signature"
             ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_non_empty_string_list(label: &str, values: &Option<Vec<String>>) -> Result<()> {
+    if let Some(values) = values {
+        for value in values {
+            if value.trim().is_empty() {
+                return Err(anyhow!("{label} values must not be empty"));
+            }
         }
     }
     Ok(())
@@ -522,7 +628,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn hex_decode(input: &str) -> Result<Vec<u8>> {
     let value = input.trim();
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(anyhow!("hex value must have even length"));
     }
     let mut out = Vec::with_capacity(value.len() / 2);

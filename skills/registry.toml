@@ -1,0 +1,56 @@
+[[skill]]
+id = "memory.recent"
+name = "Recent Memory"
+description = "Summarize recent messages for conversational continuity."
+source = "builtin"
+builtin = "memory.recent"
+tags = ["memory", "context", "history"]
+intents = ["what did we discuss", "recap", "recent messages"]
+capabilities = ["context.memory.recent"]
+publisher = "maid-official"
+enabled = true
+estimated_latency_ms = 50
+cost_tier = "free"
+
+[[skill]]
+id = "tasks.snapshot"
+name = "Task Snapshot"
+description = "Summarize active and paused tasks for the current group."
+source = "builtin"
+builtin = "tasks.snapshot"
+tags = ["tasks", "scheduler", "status"]
+intents = ["what tasks are running", "list tasks", "task status"]
+capabilities = ["context.tasks.snapshot"]
+publisher = "maid-official"
+enabled = true
+estimated_latency_ms = 70
+cost_tier = "free"
+
+[[skill]]
+id = "group.profile"
+name = "Group Profile"
+description = "Return static profile information for the current group."
+source = "builtin"
+builtin = "group.profile"
+tags = ["group", "profile", "metadata"]
+intents = ["which group is this", "group info"]
+capabilities = ["context.group.profile"]
+publisher = "maid-official"
+enabled = true
+estimated_latency_ms = 20
+cost_tier = "free"
+
+[[skill]]
+id = "siem.convert"
+name = "SIEM Convert"
+description = "Convert SIEM queries between SPL, KQL, EQL, AQL, UDM, and LogScale."
+source = "plugin"
+plugin = "siem-convert"
+command = "convert"
+tags = ["siem", "security", "migration"]
+intents = ["convert splunk to sentinel", "rewrite spl to kql", "siem migration"]
+capabilities = ["siem.query.convert.ai"]
+publisher = "acme-security"
+enabled = true
+estimated_latency_ms = 1500
+cost_tier = "medium"

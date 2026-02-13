@@ -16,6 +16,37 @@ pub struct SqliteStore {
     pool: SqlitePool,
 }
 
+#[derive(Debug, Clone)]
+pub struct PluginStatsRow {
+    pub plugin_name: String,
+    pub run_count: i64,
+    pub success_rate: f64,
+    pub avg_latency_ms: i64,
+    pub p95_latency_ms: i64,
+    pub last_seen: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginHealthDay {
+    pub day: String,
+    pub plugin_name: String,
+    pub success_rate: f64,
+    pub p50_latency_ms: i64,
+    pub p95_latency_ms: i64,
+    pub run_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewPluginInvocation<'a> {
+    pub plugin_name: &'a str,
+    pub plugin_version: &'a str,
+    pub command: &'a str,
+    pub actor: &'a str,
+    pub ok: bool,
+    pub latency_ms: i64,
+    pub created_at: DateTime<Utc>,
+}
+
 impl SqliteStore {
     pub async fn connect(database_path: &str) -> Result<Self> {
         let options = SqliteConnectOptions::new()
@@ -54,6 +85,235 @@ impl SqliteStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(row.try_get::<i64, _>("count")?)
+    }
+
+    pub async fn record_plugin_invocation(
+        &self,
+        invocation: NewPluginInvocation<'_>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO plugin_invocations \
+             (id, plugin_name, plugin_version, command, actor, ok, latency_ms, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(new_id())
+        .bind(invocation.plugin_name)
+        .bind(invocation.plugin_version)
+        .bind(invocation.command)
+        .bind(invocation.actor)
+        .bind(if invocation.ok { 1_i64 } else { 0_i64 })
+        .bind(invocation.latency_ms.max(0))
+        .bind(invocation.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        let day = invocation.created_at.format("%Y-%m-%d").to_string();
+        self.refresh_plugin_health_day(invocation.plugin_name, &day)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn record_plugin_install(
+        &self,
+        plugin_name: &str,
+        version: &str,
+        source: &str,
+        actor: &str,
+        installed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO plugin_installs \
+             (plugin_name, version, source, actor, installed_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(plugin_name)
+        .bind(version)
+        .bind(source)
+        .bind(actor)
+        .bind(installed_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_plugin_stats(
+        &self,
+        top: i64,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<PluginStatsRow>> {
+        let rows = sqlx::query(
+            "SELECT plugin_name, \
+                    COUNT(*) as run_count, \
+                    SUM(CASE WHEN ok = 1 THEN 1 ELSE 0 END) as success_count, \
+                    AVG(latency_ms) as avg_latency_ms, \
+                    MAX(created_at) as last_seen \
+             FROM plugin_invocations \
+             WHERE created_at >= ? \
+             GROUP BY plugin_name \
+             ORDER BY run_count DESC, plugin_name ASC \
+             LIMIT ?",
+        )
+        .bind(since.to_rfc3339())
+        .bind(top.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let plugin_name: String = row.try_get("plugin_name")?;
+            let run_count: i64 = row.try_get("run_count")?;
+            let success_count: i64 = row.try_get("success_count")?;
+            let avg_latency_raw: f64 = row.try_get("avg_latency_ms")?;
+            let last_seen_raw: Option<String> = row.try_get("last_seen")?;
+            let p95_latency_ms = self
+                .compute_plugin_percentile_latency(&plugin_name, since, 0.95)
+                .await?
+                .unwrap_or(0);
+            out.push(PluginStatsRow {
+                plugin_name,
+                run_count,
+                success_rate: if run_count > 0 {
+                    (success_count as f64) / (run_count as f64)
+                } else {
+                    0.0
+                },
+                avg_latency_ms: avg_latency_raw.round() as i64,
+                p95_latency_ms,
+                last_seen: last_seen_raw.as_deref().map(parse_dt).transpose()?,
+            });
+        }
+
+        Ok(out)
+    }
+
+    pub async fn plugin_success_rate_since(
+        &self,
+        plugin_name: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Option<f64>> {
+        let row = sqlx::query(
+            "SELECT AVG(CASE WHEN ok = 1 THEN 1.0 ELSE 0.0 END) as success_rate \
+             FROM plugin_invocations \
+             WHERE plugin_name = ? AND created_at >= ?",
+        )
+        .bind(plugin_name)
+        .bind(since.to_rfc3339())
+        .fetch_one(&self.pool)
+        .await?;
+        row.try_get::<Option<f64>, _>("success_rate")
+            .map_err(Into::into)
+    }
+
+    pub async fn plugin_health_days(
+        &self,
+        plugin_name: &str,
+        days: i64,
+    ) -> Result<Vec<PluginHealthDay>> {
+        let lookback = days.clamp(1, 365);
+        let start_day = (Utc::now() - chrono::Duration::days(lookback - 1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let rows = sqlx::query(
+            "SELECT day, plugin_name, success_rate, p50_latency_ms, p95_latency_ms, run_count \
+             FROM plugin_health_daily \
+             WHERE plugin_name = ? AND day >= ? \
+             ORDER BY day DESC",
+        )
+        .bind(plugin_name)
+        .bind(start_day)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(PluginHealthDay {
+                day: row.try_get("day")?,
+                plugin_name: row.try_get("plugin_name")?,
+                success_rate: row.try_get("success_rate")?,
+                p50_latency_ms: row.try_get("p50_latency_ms")?,
+                p95_latency_ms: row.try_get("p95_latency_ms")?,
+                run_count: row.try_get("run_count")?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn refresh_plugin_health_day(&self, plugin_name: &str, day: &str) -> Result<()> {
+        let rows = sqlx::query(
+            "SELECT ok, latency_ms \
+             FROM plugin_invocations \
+             WHERE plugin_name = ? AND substr(created_at, 1, 10) = ?",
+        )
+        .bind(plugin_name)
+        .bind(day)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let run_count = rows.len() as i64;
+        let mut success_count = 0_i64;
+        let mut latencies = Vec::with_capacity(rows.len());
+        for row in rows {
+            let ok: i64 = row.try_get("ok")?;
+            if ok == 1 {
+                success_count += 1;
+            }
+            let latency: i64 = row.try_get("latency_ms")?;
+            latencies.push(latency.max(0));
+        }
+        latencies.sort_unstable();
+        let p50_latency = percentile_i64(&latencies, 0.50);
+        let p95_latency = percentile_i64(&latencies, 0.95);
+        let success_rate = (success_count as f64) / (run_count as f64);
+
+        sqlx::query(
+            "INSERT INTO plugin_health_daily \
+             (day, plugin_name, success_rate, p50_latency_ms, p95_latency_ms, run_count) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(day, plugin_name) DO UPDATE SET \
+                 success_rate = excluded.success_rate, \
+                 p50_latency_ms = excluded.p50_latency_ms, \
+                 p95_latency_ms = excluded.p95_latency_ms, \
+                 run_count = excluded.run_count",
+        )
+        .bind(day)
+        .bind(plugin_name)
+        .bind(success_rate)
+        .bind(p50_latency)
+        .bind(p95_latency)
+        .bind(run_count)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn compute_plugin_percentile_latency(
+        &self,
+        plugin_name: &str,
+        since: DateTime<Utc>,
+        percentile: f64,
+    ) -> Result<Option<i64>> {
+        let rows = sqlx::query(
+            "SELECT latency_ms \
+             FROM plugin_invocations \
+             WHERE plugin_name = ? AND created_at >= ? \
+             ORDER BY latency_ms ASC",
+        )
+        .bind(plugin_name)
+        .bind(since.to_rfc3339())
+        .fetch_all(&self.pool)
+        .await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let mut latencies = Vec::with_capacity(rows.len());
+        for row in rows {
+            let latency: i64 = row.try_get("latency_ms")?;
+            latencies.push(latency.max(0));
+        }
+        Ok(Some(percentile_i64(&latencies, percentile)))
     }
 
     pub async fn list_recent_audits(
@@ -205,6 +465,17 @@ fn split_sql_statements(sql: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|stmt| !stmt.is_empty())
         .collect()
+}
+
+fn percentile_i64(sorted_values: &[i64], percentile: f64) -> i64 {
+    if sorted_values.is_empty() {
+        return 0;
+    }
+    let p = percentile.clamp(0.0, 1.0);
+    let idx = ((sorted_values.len() - 1) as f64 * p).round() as usize;
+    *sorted_values
+        .get(idx.min(sorted_values.len().saturating_sub(1)))
+        .unwrap_or(&0)
 }
 
 fn parse_dt(value: &str) -> Result<DateTime<Utc>> {
@@ -445,6 +716,31 @@ impl Storage for SqliteStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn update_task(
+        &self,
+        task_id: &str,
+        name: &str,
+        schedule_rrule: &str,
+        prompt_template: &str,
+        status: TaskStatus,
+    ) -> Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE tasks \
+             SET name = ?, schedule_rrule = ?, prompt_template = ?, status = ?, updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(name)
+        .bind(schedule_rrule)
+        .bind(prompt_template)
+        .bind(status.as_str())
+        .bind(Utc::now().to_rfc3339())
+        .bind(task_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated > 0)
     }
 
     async fn delete_task(&self, task_id: &str) -> Result<bool> {
@@ -852,6 +1148,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+
+        store
+            .record_plugin_invocation(NewPluginInvocation {
+                plugin_name: "echo",
+                plugin_version: "0.1.0",
+                command: "help",
+                actor: "cli",
+                ok: true,
+                latency_ms: 120,
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        store
+            .record_plugin_invocation(NewPluginInvocation {
+                plugin_name: "echo",
+                plugin_version: "0.1.0",
+                command: "help",
+                actor: "cli",
+                ok: false,
+                latency_ms: 500,
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        store
+            .record_plugin_install("echo", "0.1.0", "plugins/registry.toml", "cli", Utc::now())
+            .await
+            .unwrap();
+
+        let stats = store
+            .list_plugin_stats(10, Utc::now() - chrono::Duration::days(1))
+            .await
+            .unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].plugin_name, "echo");
+        assert_eq!(stats[0].run_count, 2);
+        assert!((stats[0].success_rate - 0.5).abs() < f64::EPSILON);
+
+        let health = store.plugin_health_days("echo", 7).await.unwrap();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].plugin_name, "echo");
+        assert_eq!(health[0].run_count, 2);
     }
 
     #[tokio::test]

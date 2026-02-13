@@ -7,3 +7,7 @@
 .DS_Store
 plugin-repos-local/
 plugins/code-analysis/
+plugins/*
+!plugins/echo/
+!plugins/echo/**
+!plugins/registry.toml

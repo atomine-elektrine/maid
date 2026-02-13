@@ -296,6 +296,14 @@ pub trait Storage: Send + Sync {
     async fn list_tasks(&self, group_id: &str) -> Result<Vec<Task>>;
     async fn get_task(&self, task_id: &str) -> Result<Option<Task>>;
     async fn update_task_status(&self, task_id: &str, status: TaskStatus) -> Result<()>;
+    async fn update_task(
+        &self,
+        task_id: &str,
+        name: &str,
+        schedule_rrule: &str,
+        prompt_template: &str,
+        status: TaskStatus,
+    ) -> Result<bool>;
     async fn delete_task(&self, task_id: &str) -> Result<bool>;
     async fn clear_tasks_for_group(&self, group_id: &str) -> Result<u64>;
     async fn clear_all_tasks(&self) -> Result<u64>;
@@ -526,6 +534,72 @@ where
             .await?
             .ok_or_else(|| anyhow!("group not found: {group_name}"))?;
         self.store.list_tasks(&group.id).await
+    }
+
+    pub async fn update_task(
+        &self,
+        task_id: &str,
+        name: &str,
+        schedule_rrule: &str,
+        prompt_template: &str,
+        status: TaskStatus,
+        actor: &str,
+    ) -> Result<Option<Task>> {
+        validate_task_name(name)?;
+        validate_schedule(schedule_rrule)?;
+        validate_prompt(prompt_template)?;
+
+        let Some(existing) = self.store.get_task(task_id).await? else {
+            let _ = self
+                .store
+                .insert_audit(NewAudit {
+                    group_id: None,
+                    action: "TASK_UPDATE".to_string(),
+                    actor: actor.to_string(),
+                    result: "NOT_FOUND".to_string(),
+                    created_at: Utc::now(),
+                    metadata_json: Some(json!({ "task_id": task_id })),
+                })
+                .await;
+            return Ok(None);
+        };
+
+        let group = self
+            .store
+            .get_group_by_id(&existing.group_id)
+            .await?
+            .ok_or_else(|| anyhow!("group not found for task: {}", existing.group_id))?;
+
+        if prompt_template.trim_start().starts_with("job:")
+            && !self.is_job_task_allowed_for_group(&group.name)
+        {
+            return Err(anyhow!(
+                "job tasks are disabled for group '{}' by policy",
+                group.name
+            ));
+        }
+
+        let status_label = status.as_str().to_string();
+        self.store
+            .update_task(task_id, name, schedule_rrule, prompt_template, status)
+            .await?;
+        let updated = self.store.get_task(task_id).await?;
+
+        let _ = self
+            .store
+            .insert_audit(NewAudit {
+                group_id: Some(group.id),
+                action: "TASK_UPDATE".to_string(),
+                actor: actor.to_string(),
+                result: "SUCCESS".to_string(),
+                created_at: Utc::now(),
+                metadata_json: Some(
+                    json!({ "task_id": task_id, "name": name, "status": status_label }),
+                ),
+            })
+            .await;
+
+        Ok(updated)
     }
 
     pub async fn pause_task(&self, task_id: &str, actor: &str) -> Result<()> {
