@@ -11,3 +11,4 @@ plugins/*
 !plugins/echo/
 !plugins/echo/**
 !plugins/registry.toml
+node_modules/

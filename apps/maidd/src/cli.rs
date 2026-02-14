@@ -161,6 +161,26 @@ pub(crate) enum TaskCommands {
         #[arg(long)]
         prompt: String,
     },
+    CronAdd {
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        every_minutes: u64,
+        #[arg(long)]
+        prompt: String,
+    },
+    CronList {
+        #[arg(long)]
+        group: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    CronRemove {
+        #[arg(long)]
+        id: String,
+    },
     #[command(visible_alias = "ls")]
     List {
         #[arg(long)]

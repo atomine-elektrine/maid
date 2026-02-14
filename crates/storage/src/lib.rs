@@ -47,6 +47,32 @@ pub struct NewPluginInvocation<'a> {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct WebhookRoute {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub token: Option<String>,
+    pub group_id: String,
+    pub task_id: Option<String>,
+    pub prompt_template: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_triggered_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewWebhookRoute {
+    pub name: String,
+    pub path: String,
+    pub token: Option<String>,
+    pub group_id: String,
+    pub task_id: Option<String>,
+    pub prompt_template: Option<String>,
+    pub enabled: bool,
+}
+
 impl SqliteStore {
     pub async fn connect(database_path: &str) -> Result<Self> {
         let options = SqliteConnectOptions::new()
@@ -316,6 +342,151 @@ impl SqliteStore {
         Ok(Some(percentile_i64(&latencies, percentile)))
     }
 
+    pub async fn create_webhook_route(&self, route: NewWebhookRoute) -> Result<WebhookRoute> {
+        let name = route.name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("webhook route name must not be empty"));
+        }
+        let path = route.path.trim().trim_matches('/');
+        if path.is_empty() {
+            return Err(anyhow!("webhook route path must not be empty"));
+        }
+        let token = route
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string());
+        let prompt_template = route
+            .prompt_template
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string());
+        if route
+            .task_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+            && prompt_template.is_none()
+        {
+            return Err(anyhow!("webhook route requires task_id or prompt_template"));
+        }
+
+        let id = new_id();
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO webhook_routes \
+             (id, name, path, token, group_id, task_id, prompt_template, enabled, created_at, updated_at, last_triggered_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(path)
+        .bind(token)
+        .bind(route.group_id)
+        .bind(route.task_id)
+        .bind(prompt_template)
+        .bind(if route.enabled { 1_i64 } else { 0_i64 })
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        self.get_webhook_route_by_id(&id)
+            .await?
+            .ok_or_else(|| anyhow!("failed to load inserted webhook route"))
+    }
+
+    pub async fn list_webhook_routes(&self, include_disabled: bool) -> Result<Vec<WebhookRoute>> {
+        let rows = if include_disabled {
+            sqlx::query(
+                "SELECT id, name, path, token, group_id, task_id, prompt_template, enabled, created_at, updated_at, last_triggered_at \
+                 FROM webhook_routes \
+                 ORDER BY created_at DESC",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, name, path, token, group_id, task_id, prompt_template, enabled, created_at, updated_at, last_triggered_at \
+                 FROM webhook_routes \
+                 WHERE enabled = 1 \
+                 ORDER BY created_at DESC",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+        rows.iter().map(row_to_webhook_route).collect()
+    }
+
+    pub async fn get_webhook_route_by_path(&self, raw_path: &str) -> Result<Option<WebhookRoute>> {
+        let path = raw_path.trim().trim_matches('/');
+        if path.is_empty() {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT id, name, path, token, group_id, task_id, prompt_template, enabled, created_at, updated_at, last_triggered_at \
+             FROM webhook_routes \
+             WHERE path = ? AND enabled = 1 \
+             LIMIT 1",
+        )
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_webhook_route).transpose()
+    }
+
+    pub async fn get_webhook_route_by_id(&self, id: &str) -> Result<Option<WebhookRoute>> {
+        let row = sqlx::query(
+            "SELECT id, name, path, token, group_id, task_id, prompt_template, enabled, created_at, updated_at, last_triggered_at \
+             FROM webhook_routes \
+             WHERE id = ? \
+             LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(row_to_webhook_route).transpose()
+    }
+
+    pub async fn delete_webhook_route(&self, id_or_name_or_path: &str) -> Result<bool> {
+        let key = id_or_name_or_path.trim().trim_matches('/');
+        if key.is_empty() {
+            return Ok(false);
+        }
+        let deleted = sqlx::query(
+            "DELETE FROM webhook_routes \
+             WHERE id = ? OR name = ? OR path = ?",
+        )
+        .bind(key)
+        .bind(key)
+        .bind(key)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(deleted > 0)
+    }
+
+    pub async fn mark_webhook_route_triggered(
+        &self,
+        route_id: &str,
+        triggered_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE webhook_routes \
+             SET last_triggered_at = ?, updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(triggered_at.to_rfc3339())
+        .bind(triggered_at.to_rfc3339())
+        .bind(route_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn list_recent_audits(
         &self,
         limit: i64,
@@ -557,6 +728,23 @@ fn row_to_telegram_pairing(row: &sqlx::sqlite::SqliteRow) -> Result<TelegramPair
         status: TelegramPairingStatus::from_db(&row.try_get::<String, _>("status")?)?,
         requested_at: parse_dt(&row.try_get::<String, _>("requested_at")?)?,
         approved_at: approved_raw.as_deref().map(parse_dt).transpose()?,
+    })
+}
+
+fn row_to_webhook_route(row: &sqlx::sqlite::SqliteRow) -> Result<WebhookRoute> {
+    let last_triggered_raw: Option<String> = row.try_get("last_triggered_at")?;
+    Ok(WebhookRoute {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        path: row.try_get("path")?,
+        token: row.try_get("token")?,
+        group_id: row.try_get("group_id")?,
+        task_id: row.try_get("task_id")?,
+        prompt_template: row.try_get("prompt_template")?,
+        enabled: row.try_get::<i64, _>("enabled")? != 0,
+        created_at: parse_dt(&row.try_get::<String, _>("created_at")?)?,
+        updated_at: parse_dt(&row.try_get::<String, _>("updated_at")?)?,
+        last_triggered_at: last_triggered_raw.as_deref().map(parse_dt).transpose()?,
     })
 }
 
@@ -1221,6 +1409,61 @@ mod tests {
             .approve_telegram_pairing_by_code("NOTREAL")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn webhook_route_lifecycle() {
+        let store = setup_store().await;
+        let group = store.create_group("hooks", "/tmp/hooks").await.unwrap();
+        let task = store
+            .create_task(NewTask {
+                group_id: group.id.clone(),
+                name: "hook-task".to_string(),
+                schedule_rrule: "FREQ=HOURLY;INTERVAL=1".to_string(),
+                prompt_template: "ping".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let route = store
+            .create_webhook_route(NewWebhookRoute {
+                name: "alerts".to_string(),
+                path: "/alerts/new".to_string(),
+                token: Some("secret".to_string()),
+                group_id: group.id.clone(),
+                task_id: Some(task.id.clone()),
+                prompt_template: None,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(route.name, "alerts");
+        assert_eq!(route.path, "alerts/new");
+
+        let by_path = store.get_webhook_route_by_path("alerts/new").await.unwrap();
+        assert!(by_path.is_some());
+        assert_eq!(by_path.unwrap().id, route.id);
+
+        store
+            .mark_webhook_route_triggered(&route.id, Utc::now())
+            .await
+            .unwrap();
+        let refreshed = store
+            .get_webhook_route_by_id(&route.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(refreshed.last_triggered_at.is_some());
+
+        let listed = store.list_webhook_routes(true).await.unwrap();
+        assert_eq!(listed.len(), 1);
+
+        assert!(store.delete_webhook_route(&route.name).await.unwrap());
+        assert!(store
+            .get_webhook_route_by_path("alerts/new")
+            .await
+            .unwrap()
+            .is_none());
     }
 }
 

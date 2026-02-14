@@ -57,12 +57,55 @@ pub(crate) async fn handle_task_command(
                 task.name, task.id, schedule
             );
         }
+        TaskCommands::CronAdd {
+            group,
+            name,
+            every_minutes,
+            prompt,
+        } => {
+            if every_minutes == 0 || every_minutes > 1_440 {
+                return Err(anyhow!(
+                    "--every-minutes must be between 1 and 1440 (got {every_minutes})"
+                ));
+            }
+            let schedule = format!("FREQ=MINUTELY;INTERVAL={every_minutes}");
+            Schedule::parse_rrule(&schedule)
+                .with_context(|| format!("invalid generated schedule RRULE: {}", schedule))?;
+            let task = service
+                .create_task(&group, &name, &schedule, &prompt, "cli")
+                .await?;
+            println!(
+                "created cron task '{}' ({}) with schedule {}",
+                task.name, task.id, schedule
+            );
+        }
         TaskCommands::List { group, json } => {
             let tasks = service.list_tasks(&group).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&tasks)?);
             } else if tasks.is_empty() {
                 println!("no tasks found for group '{group}'");
+            } else {
+                let rows = tasks
+                    .into_iter()
+                    .map(|task| {
+                        vec![
+                            task.id,
+                            truncate_line(&task.name, 24),
+                            task.status.as_str().to_string(),
+                            task.schedule_rrule,
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                print_table(&["ID", "NAME", "STATUS", "SCHEDULE"], &rows);
+            }
+        }
+        TaskCommands::CronList { group, json } => {
+            let tasks = service.list_tasks(&group).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tasks)?);
+            } else if tasks.is_empty() {
+                println!("no cron tasks found for group '{group}'");
             } else {
                 let rows = tasks
                     .into_iter()
@@ -110,6 +153,14 @@ pub(crate) async fn handle_task_command(
                 println!("deleted task {id}");
             } else {
                 println!("task not found: {id}");
+            }
+        }
+        TaskCommands::CronRemove { id } => {
+            let deleted = service.delete_task(&id, "cli").await?;
+            if deleted {
+                println!("deleted cron task {id}");
+            } else {
+                println!("cron task not found: {id}");
             }
         }
         TaskCommands::Clear { group } => {

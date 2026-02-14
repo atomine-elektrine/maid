@@ -60,7 +60,7 @@ use serde_json::json;
 use service::{handle_service_command, handle_tunnel_command};
 use subagent::handle_subagent_command;
 use task_commands::{handle_task_command, prompt_with_default, schedule_from_human_or_rrule};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -403,7 +403,7 @@ async fn run() -> Result<()> {
     apply_config_path_from_env(&mut cli);
     if let Some(parent) = cli.config.parent() {
         let config_env_path = parent.join(".env");
-        if config_env_path != PathBuf::from(".env") {
+        if config_env_path != Path::new(".env") {
             load_dotenv_file(&config_env_path);
             apply_config_path_from_env(&mut cli);
         }
@@ -479,16 +479,14 @@ async fn run() -> Result<()> {
                     let groups = service.list_groups().await?;
                     if json {
                         println!("{}", serde_json::to_string_pretty(&groups)?);
+                    } else if groups.is_empty() {
+                        println!("no groups found");
                     } else {
-                        if groups.is_empty() {
-                            println!("no groups found");
-                        } else {
-                            let rows = groups
-                                .into_iter()
-                                .map(|group| vec![group.id, group.name, group.root_path])
-                                .collect::<Vec<_>>();
-                            print_table(&["ID", "NAME", "ROOT_PATH"], &rows);
-                        }
+                        let rows = groups
+                            .into_iter()
+                            .map(|group| vec![group.id, group.name, group.root_path])
+                            .collect::<Vec<_>>();
+                        print_table(&["ID", "NAME", "ROOT_PATH"], &rows);
                     }
                 }
             }

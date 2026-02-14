@@ -230,6 +230,30 @@ pub(crate) struct AutoActionContext {
     pub(crate) tool_context: Option<String>,
 }
 
+pub(crate) struct PluginSearchRequest<'a> {
+    pub(crate) query: Option<&'a str>,
+    pub(crate) category: Option<&'a str>,
+    pub(crate) tag: Option<&'a str>,
+    pub(crate) capability: Option<&'a str>,
+    pub(crate) ranked: bool,
+    pub(crate) json_output: bool,
+}
+
+pub(crate) struct PluginSearchFilters<'a> {
+    pub(crate) query: Option<&'a str>,
+    pub(crate) category: Option<&'a str>,
+    pub(crate) tag: Option<&'a str>,
+    pub(crate) capability: Option<&'a str>,
+}
+
+pub(crate) struct PluginSearchCorpus<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) description: &'a str,
+    pub(crate) categories: &'a [String],
+    pub(crate) tags: &'a [String],
+    pub(crate) capabilities: &'a [String],
+}
+
 pub(crate) async fn handle_pairing_command(
     service: Arc<AppService>,
     command: PairingCommands,
@@ -239,22 +263,20 @@ pub(crate) async fn handle_pairing_command(
             let rows = service.list_pending_telegram_pairings().await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if rows.is_empty() {
+                println!("no pending pairing requests");
             } else {
-                if rows.is_empty() {
-                    println!("no pending pairing requests");
-                } else {
-                    let lines = rows
-                        .into_iter()
-                        .map(|pairing| {
-                            vec![
-                                pairing.code,
-                                pairing.chat_id.to_string(),
-                                pairing.requested_at.to_rfc3339(),
-                            ]
-                        })
-                        .collect::<Vec<_>>();
-                    print_table(&["CODE", "CHAT_ID", "REQUESTED_AT"], &lines);
-                }
+                let lines = rows
+                    .into_iter()
+                    .map(|pairing| {
+                        vec![
+                            pairing.code,
+                            pairing.chat_id.to_string(),
+                            pairing.requested_at.to_rfc3339(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                print_table(&["CODE", "CHAT_ID", "REQUESTED_AT"], &lines);
             }
         }
         PairingCommands::Approve { code } => {
@@ -291,19 +313,16 @@ pub(crate) async fn handle_plugin_command(
         } => {
             let plugins_dir = resolve_plugins_dir(cfg, dir);
             let index_path = resolve_registry_index_path(cfg, index);
-            handle_plugin_search_command(
-                cfg,
-                store.clone(),
-                &plugins_dir,
-                &index_path,
-                query.as_deref(),
-                category.as_deref(),
-                tag.as_deref(),
-                capability.as_deref(),
+            let request = PluginSearchRequest {
+                query: query.as_deref(),
+                category: category.as_deref(),
+                tag: tag.as_deref(),
+                capability: capability.as_deref(),
                 ranked,
-                json,
-            )
-            .await?;
+                json_output: json,
+            };
+            handle_plugin_search_command(cfg, store.clone(), &plugins_dir, &index_path, &request)
+                .await?;
         }
         PluginCommands::Info {
             name,
@@ -1285,19 +1304,20 @@ pub(crate) async fn handle_plugin_search_command(
     store: Arc<SqliteStore>,
     plugins_dir: &Path,
     index_path: &Path,
-    query: Option<&str>,
-    category: Option<&str>,
-    tag: Option<&str>,
-    capability: Option<&str>,
-    ranked: bool,
-    json_output: bool,
+    request: &PluginSearchRequest<'_>,
 ) -> Result<()> {
     let local_plugins = discover_plugins(plugins_dir).unwrap_or_default();
     let registry_entries = load_plugin_registry(index_path).unwrap_or_default();
-    let query_lower = query.map(|v| v.to_ascii_lowercase());
-    let category_lower = category.map(|v| v.to_ascii_lowercase());
-    let tag_lower = tag.map(|v| v.to_ascii_lowercase());
-    let capability_lower = capability.map(|v| v.to_ascii_lowercase());
+    let query_lower = request.query.map(|v| v.to_ascii_lowercase());
+    let category_lower = request.category.map(|v| v.to_ascii_lowercase());
+    let tag_lower = request.tag.map(|v| v.to_ascii_lowercase());
+    let capability_lower = request.capability.map(|v| v.to_ascii_lowercase());
+    let filters = PluginSearchFilters {
+        query: query_lower.as_deref(),
+        category: category_lower.as_deref(),
+        tag: tag_lower.as_deref(),
+        capability: capability_lower.as_deref(),
+    };
 
     #[derive(Debug, Clone)]
     struct SearchRow {
@@ -1319,7 +1339,7 @@ pub(crate) async fn handle_plugin_search_command(
         let tags = entry.tags.clone().unwrap_or_default();
         let capabilities = entry.capabilities.clone().unwrap_or_default();
         let relevance = text_relevance_score(
-            query_lower.as_deref(),
+            filters.query,
             &entry.name,
             &description,
             &categories,
@@ -1327,15 +1347,14 @@ pub(crate) async fn handle_plugin_search_command(
             &capabilities,
         );
         if !search_filters_match(
-            query_lower.as_deref(),
-            category_lower.as_deref(),
-            tag_lower.as_deref(),
-            capability_lower.as_deref(),
-            &entry.name,
-            &description,
-            &categories,
-            &tags,
-            &capabilities,
+            &filters,
+            &PluginSearchCorpus {
+                name: &entry.name,
+                description: &description,
+                categories: &categories,
+                tags: &tags,
+                capabilities: &capabilities,
+            },
         ) {
             continue;
         }
@@ -1382,7 +1401,7 @@ pub(crate) async fn handle_plugin_search_command(
         let tags = plugin.manifest.tags.clone().unwrap_or_default();
         let capabilities = plugin.manifest.capabilities.clone().unwrap_or_default();
         let relevance = text_relevance_score(
-            query_lower.as_deref(),
+            filters.query,
             &plugin.manifest.name,
             &description,
             &categories,
@@ -1390,15 +1409,14 @@ pub(crate) async fn handle_plugin_search_command(
             &capabilities,
         );
         if !search_filters_match(
-            query_lower.as_deref(),
-            category_lower.as_deref(),
-            tag_lower.as_deref(),
-            capability_lower.as_deref(),
-            &plugin.manifest.name,
-            &description,
-            &categories,
-            &tags,
-            &capabilities,
+            &filters,
+            &PluginSearchCorpus {
+                name: &plugin.manifest.name,
+                description: &description,
+                categories: &categories,
+                tags: &tags,
+                capabilities: &capabilities,
+            },
         ) {
             continue;
         }
@@ -1429,14 +1447,14 @@ pub(crate) async fn handle_plugin_search_command(
 
     let mut rows = rows_by_name.into_values().collect::<Vec<_>>();
     if rows.is_empty() {
-        if json_output {
+        if request.json_output {
             println!("[]");
         } else {
             println!("no plugins matched filters");
         }
         return Ok(());
     }
-    if ranked {
+    if request.ranked {
         let since = Utc::now() - chrono::Duration::days(30);
         let mut scored = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1462,7 +1480,7 @@ pub(crate) async fn handle_plugin_search_command(
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.name.cmp(&b.0.name))
         });
-        if json_output {
+        if request.json_output {
             let payload = scored
                 .into_iter()
                 .map(|(row, rank)| {
@@ -1516,7 +1534,7 @@ pub(crate) async fn handle_plugin_search_command(
     }
 
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    if json_output {
+    if request.json_output {
         let payload = rows
             .into_iter()
             .map(|row| {
@@ -1706,48 +1724,44 @@ pub(crate) fn join_or_none(values: Vec<String>) -> String {
 }
 
 pub(crate) fn search_filters_match(
-    query: Option<&str>,
-    category: Option<&str>,
-    tag: Option<&str>,
-    capability: Option<&str>,
-    name: &str,
-    description: &str,
-    categories: &[String],
-    tags: &[String],
-    capabilities: &[String],
+    filters: &PluginSearchFilters<'_>,
+    corpus: &PluginSearchCorpus<'_>,
 ) -> bool {
-    if let Some(needle) = query {
+    if let Some(needle) = filters.query {
         let haystack = format!(
             "{} {} {} {} {}",
-            name,
-            description,
-            categories.join(" "),
-            tags.join(" "),
-            capabilities.join(" ")
+            corpus.name,
+            corpus.description,
+            corpus.categories.join(" "),
+            corpus.tags.join(" "),
+            corpus.capabilities.join(" ")
         )
         .to_ascii_lowercase();
         if !haystack.contains(needle) {
             return false;
         }
     }
-    if let Some(category) = category {
-        if !categories
+    if let Some(category) = filters.category {
+        if !corpus
+            .categories
             .iter()
             .any(|candidate| candidate.to_ascii_lowercase() == category)
         {
             return false;
         }
     }
-    if let Some(tag) = tag {
-        if !tags
+    if let Some(tag) = filters.tag {
+        if !corpus
+            .tags
             .iter()
             .any(|candidate| candidate.to_ascii_lowercase() == tag)
         {
             return false;
         }
     }
-    if let Some(capability) = capability {
-        if !capabilities
+    if let Some(capability) = filters.capability {
+        if !corpus
+            .capabilities
             .iter()
             .any(|candidate| candidate.to_ascii_lowercase() == capability)
         {
@@ -1912,14 +1926,14 @@ pub(crate) fn enforce_registry_entry_trust_policy(
     cfg: &AppConfig,
     entry: &PluginRegistryEntry,
 ) -> Result<()> {
-    if cfg.plugin_require_signatures()
-        && entry
-            .signature
-            .as_ref()
-            .map(|v| v.trim().is_empty())
-            .unwrap_or(true)
-        && !(cfg.plugin_allow_unsigned_local() && !is_git_source(&entry.source))
-    {
+    let source_requires_signature =
+        is_git_source(&entry.source) || !cfg.plugin_allow_unsigned_local();
+    let missing_signature = entry
+        .signature
+        .as_ref()
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true);
+    if cfg.plugin_require_signatures() && missing_signature && source_requires_signature {
         return Err(anyhow!(
             "registry plugin '{}' is unsigned and signature policy requires signatures",
             entry.name
@@ -2661,8 +2675,8 @@ pub(crate) async fn handle_tool_command(
                 session.allowed_tools
             } else {
                 supported_tool_names()
-                    .into_iter()
-                    .map(|s| s.to_string())
+                    .iter()
+                    .map(|s| (*s).to_string())
                     .collect()
             };
             if json {

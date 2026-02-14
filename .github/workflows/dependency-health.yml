@@ -1,0 +1,30 @@
+name: Dependency Health
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  dependency-health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install dependency tooling
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-outdated,cargo-audit,cargo-deny
+
+      - name: Run dependency checks
+        run: ./scripts/check-deps.sh

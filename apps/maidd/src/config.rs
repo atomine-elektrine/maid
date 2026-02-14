@@ -286,17 +286,16 @@ impl AppConfig {
                     ));
                 }
             }
-            if matches!(telegram.activation_mode.as_deref(), Some("mention")) {
-                if telegram
+            if matches!(telegram.activation_mode.as_deref(), Some("mention"))
+                && telegram
                     .mention_token
                     .as_ref()
                     .map(|v| v.trim().is_empty())
                     .unwrap_or(true)
-                {
-                    return Err(anyhow!(
-                        "telegram.mention_token must be set when activation_mode=mention"
-                    ));
-                }
+            {
+                return Err(anyhow!(
+                    "telegram.mention_token must be set when activation_mode=mention"
+                ));
             }
             if let Some(per_chat) = &telegram.per_chat_activation_mode {
                 for (chat_id, mode) in per_chat {

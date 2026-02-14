@@ -17,32 +17,30 @@ pub(crate) async fn handle_audit_command(
                 .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if rows.is_empty() {
+                println!("no audits found");
             } else {
-                if rows.is_empty() {
-                    println!("no audits found");
-                } else {
-                    let lines = rows
-                        .into_iter()
-                        .map(|audit| {
-                            let time = audit.created_at.format("%Y-%m-%d %H:%M:%S").to_string();
-                            let metadata = audit
-                                .metadata_json
-                                .map(|v| truncate_line(&v.to_string(), 64))
-                                .unwrap_or_else(|| "{}".to_string());
-                            vec![
-                                time,
-                                truncate_line(&audit.action, 20),
-                                truncate_line(&audit.actor, 16),
-                                truncate_line(&audit.result, 8),
-                                metadata,
-                            ]
-                        })
-                        .collect::<Vec<_>>();
-                    print_table(
-                        &["TIME(UTC)", "ACTION", "ACTOR", "RESULT", "METADATA"],
-                        &lines,
-                    );
-                }
+                let lines = rows
+                    .into_iter()
+                    .map(|audit| {
+                        let time = audit.created_at.format("%Y-%m-%d %H:%M:%S").to_string();
+                        let metadata = audit
+                            .metadata_json
+                            .map(|v| truncate_line(&v.to_string(), 64))
+                            .unwrap_or_else(|| "{}".to_string());
+                        vec![
+                            time,
+                            truncate_line(&audit.action, 20),
+                            truncate_line(&audit.actor, 16),
+                            truncate_line(&audit.result, 8),
+                            metadata,
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                print_table(
+                    &["TIME(UTC)", "ACTION", "ACTOR", "RESULT", "METADATA"],
+                    &lines,
+                );
             }
         }
     }
@@ -102,6 +100,23 @@ pub(crate) fn load_plugin_tool_session_from_env_optional() -> Result<Option<Plug
     session.allowed_tools = normalized;
 
     Ok(Some(session))
+}
+
+pub(crate) struct ManagedProcess {
+    pub(crate) group: String,
+    pub(crate) command: String,
+    pub(crate) pid: Option<u32>,
+    pub(crate) started_at: DateTime<Utc>,
+    pub(crate) stdout_path: PathBuf,
+    pub(crate) stderr_path: PathBuf,
+    pub(crate) child: tokio::process::Child,
+}
+
+static PROCESS_REGISTRY: OnceLock<tokio::sync::Mutex<HashMap<String, ManagedProcess>>> =
+    OnceLock::new();
+
+pub(crate) fn process_registry() -> &'static tokio::sync::Mutex<HashMap<String, ManagedProcess>> {
+    PROCESS_REGISTRY.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
 pub(crate) async fn execute_tool_call(
@@ -238,6 +253,21 @@ pub(crate) async fn execute_tool_call(
                 "deleted": deleted
             }))
         }
+        "session.list" => execute_session_list_tool(service, tool).await,
+        "session.history" => execute_session_history_tool(service, tool, args).await,
+        "session.send" => execute_session_send_tool(service, tool, args, actor).await,
+        "session.spawn" => execute_session_spawn_tool(service, tool, args, actor).await,
+        "webhook.register" => execute_webhook_register_tool(service, tool, args, actor).await,
+        "webhook.list" => execute_webhook_list_tool(service, tool, args).await,
+        "webhook.delete" => execute_webhook_delete_tool(service, tool, args, actor).await,
+        "fs.list" => execute_fs_list_tool(service, tool, args).await,
+        "fs.read" => execute_fs_read_tool(service, tool, args).await,
+        "fs.grep" => execute_fs_grep_tool(cfg, service, tool, args).await,
+        "fs.edit" => execute_fs_edit_tool(service, tool, args).await,
+        "proc.start" => execute_proc_start_tool(service, tool, args).await,
+        "proc.wait" => execute_proc_wait_tool(tool, args).await,
+        "proc.kill" => execute_proc_kill_tool(tool, args).await,
+        "proc.logs" => execute_proc_logs_tool(tool, args).await,
         "ops.web_fetch" => execute_web_fetch_tool(cfg, tool, args).await,
         "ops.search" => execute_web_search_tool(cfg, tool, args).await,
         "ops.grep" => execute_grep_tool(cfg, service, tool, args).await,
@@ -247,6 +277,662 @@ pub(crate) async fn execute_tool_call(
         "ops.code_analysis.list" => execute_code_analysis_list_tool(service, tool, args).await,
         _ => Err(anyhow!("unsupported tool '{}'", tool)),
     }
+}
+
+pub(crate) async fn resolve_group_root(
+    service: Arc<AppService>,
+    group_name: &str,
+) -> Result<(maid_core::Group, PathBuf)> {
+    let group = service
+        .store
+        .get_group_by_name(group_name)
+        .await?
+        .ok_or_else(|| anyhow!("group not found: {group_name}"))?;
+    let group_root = fs::canonicalize(&group.root_path)
+        .with_context(|| format!("failed to resolve group root {}", group.root_path))?;
+    Ok((group, group_root))
+}
+
+pub(crate) fn resolve_existing_group_path(group_root: &Path, relative: &str) -> Result<PathBuf> {
+    if Path::new(relative).is_absolute() {
+        return Err(anyhow!("path must be relative to the group root"));
+    }
+    let candidate = fs::canonicalize(group_root.join(relative))
+        .with_context(|| format!("failed to resolve path {}", relative))?;
+    if !candidate.starts_with(group_root) {
+        return Err(anyhow!("path escapes group root"));
+    }
+    Ok(candidate)
+}
+
+pub(crate) fn resolve_writable_group_file_path(
+    group_root: &Path,
+    relative: &str,
+) -> Result<PathBuf> {
+    if Path::new(relative).is_absolute() {
+        return Err(anyhow!("path must be relative to the group root"));
+    }
+    let target = group_root.join(relative);
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow!("target path must include a filename"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
+    let parent_canonical = fs::canonicalize(parent)
+        .with_context(|| format!("failed to resolve parent path {}", parent.display()))?;
+    if !parent_canonical.starts_with(group_root) {
+        return Err(anyhow!("path escapes group root"));
+    }
+    Ok(target)
+}
+
+pub(crate) async fn execute_session_list_tool(
+    service: Arc<AppService>,
+    tool: &str,
+) -> Result<serde_json::Value> {
+    let groups = service.list_groups().await?;
+    Ok(json!({
+        "tool": tool,
+        "sessions": groups.into_iter().map(|group| json!({
+            "id": group.id,
+            "name": group.name,
+            "root_path": group.root_path,
+            "created_at": group.created_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+pub(crate) async fn execute_session_history_tool(
+    service: Arc<AppService>,
+    tool: &str,
+    args: BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
+    let group_name = required_arg(&args, "group")?;
+    let limit = parse_u64_arg(&args, "limit", 50, 1, 500)? as i64;
+    let group = service
+        .store
+        .get_group_by_name(group_name)
+        .await?
+        .ok_or_else(|| anyhow!("group not found: {group_name}"))?;
+    let messages = service.store.list_recent_messages(&group.id, limit).await?;
+    Ok(json!({
+        "tool": tool,
+        "group": group_name,
+        "limit": limit,
+        "messages": messages.into_iter().map(|row| json!({
+            "id": row.id,
+            "role": row.role.as_str(),
+            "content": row.content,
+            "created_at": row.created_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+pub(crate) async fn execute_session_send_tool(
+    service: Arc<AppService>,
+    tool: &str,
+    args: BTreeMap<String, String>,
+    actor: &str,
+) -> Result<serde_json::Value> {
+    let to_group = required_arg(&args, "to_group")
+        .or_else(|_| required_arg(&args, "group"))?
+        .trim();
+    let prompt = required_arg(&args, "prompt")?;
+    let from_group = args
+        .get("from_group")
+        .cloned()
+        .unwrap_or_else(|| "main".to_string());
+    if to_group.is_empty() {
+        return Err(anyhow!("to_group must not be empty"));
+    }
+    service.ensure_group(to_group, actor).await?;
+    let output = service.run_prompt(to_group, prompt, actor).await?;
+    Ok(json!({
+        "tool": tool,
+        "from_group": from_group,
+        "to_group": to_group,
+        "prompt": prompt,
+        "output": output,
+    }))
+}
+
+pub(crate) async fn execute_session_spawn_tool(
+    service: Arc<AppService>,
+    tool: &str,
+    args: BTreeMap<String, String>,
+    actor: &str,
+) -> Result<serde_json::Value> {
+    let name = required_arg(&args, "name")
+        .or_else(|_| required_arg(&args, "group"))?
+        .trim();
+    if name.is_empty() {
+        return Err(anyhow!("name must not be empty"));
+    }
+    let group = service.ensure_group(name, actor).await?;
+    Ok(json!({
+        "tool": tool,
+        "session": {
+            "id": group.id,
+            "name": group.name,
+            "root_path": group.root_path,
+            "created_at": group.created_at.to_rfc3339(),
+        }
+    }))
+}
+
+pub(crate) async fn execute_webhook_register_tool(
+    service: Arc<AppService>,
+    tool: &str,
+    args: BTreeMap<String, String>,
+    actor: &str,
+) -> Result<serde_json::Value> {
+    let name = required_arg(&args, "name")?;
+    let path = required_arg(&args, "path")?;
+    let group_name = required_arg(&args, "group")?;
+    let task_id = args
+        .get("task_id")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+    let prompt_template = args
+        .get("prompt")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+    let token = args
+        .get("token")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+    let enabled = parse_bool_arg(&args, "enabled", true)?;
+    let group = service.ensure_group(group_name, actor).await?;
+
+    if let Some(task_id) = &task_id {
+        let task = service
+            .store
+            .get_task(task_id)
+            .await?
+            .ok_or_else(|| anyhow!("task not found: {}", task_id))?;
+        if task.group_id != group.id {
+            return Err(anyhow!(
+                "task '{}' does not belong to group '{}'",
+                task_id,
+                group_name
+            ));
+        }
+    }
+
+    let route = service
+        .store
+        .create_webhook_route(maid_storage::NewWebhookRoute {
+            name: name.trim().to_string(),
+            path: path.trim().trim_matches('/').to_string(),
+            token,
+            group_id: group.id.clone(),
+            task_id,
+            prompt_template,
+            enabled,
+        })
+        .await?;
+
+    let _ = service
+        .store
+        .insert_audit(NewAudit {
+            group_id: Some(group.id),
+            action: "WEBHOOK_ROUTE_CREATE".to_string(),
+            actor: actor.to_string(),
+            result: "SUCCESS".to_string(),
+            created_at: Utc::now(),
+            metadata_json: Some(json!({
+                "route_id": route.id,
+                "name": route.name,
+                "path": route.path,
+                "task_id": route.task_id,
+            })),
+        })
+        .await;
+
+    Ok(json!({
+        "tool": tool,
+        "route": {
+            "id": route.id,
+            "name": route.name,
+            "path": route.path,
+            "group_id": route.group_id,
+            "task_id": route.task_id,
+            "prompt_template_set": route.prompt_template.as_ref().map(|v| !v.is_empty()).unwrap_or(false),
+            "token_set": route.token.as_ref().map(|v| !v.is_empty()).unwrap_or(false),
+            "enabled": route.enabled,
+            "created_at": route.created_at.to_rfc3339(),
+            "updated_at": route.updated_at.to_rfc3339(),
+            "last_triggered_at": route.last_triggered_at.map(|v| v.to_rfc3339()),
+        }
+    }))
+}
+
+pub(crate) async fn execute_webhook_list_tool(
+    service: Arc<AppService>,
+    tool: &str,
+    args: BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
+    let include_disabled = parse_bool_arg(&args, "include_disabled", true)?;
+    let routes = service.store.list_webhook_routes(include_disabled).await?;
+    Ok(json!({
+        "tool": tool,
+        "include_disabled": include_disabled,
+        "routes": routes.into_iter().map(|route| json!({
+            "id": route.id,
+            "name": route.name,
+            "path": route.path,
+            "group_id": route.group_id,
+            "task_id": route.task_id,
+            "prompt_template_set": route.prompt_template.as_ref().map(|v| !v.is_empty()).unwrap_or(false),
+            "token_set": route.token.as_ref().map(|v| !v.is_empty()).unwrap_or(false),
+            "enabled": route.enabled,
+            "created_at": route.created_at.to_rfc3339(),
+            "updated_at": route.updated_at.to_rfc3339(),
+            "last_triggered_at": route.last_triggered_at.map(|v| v.to_rfc3339()),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+pub(crate) async fn execute_webhook_delete_tool(
+    service: Arc<AppService>,
+    tool: &str,
+    args: BTreeMap<String, String>,
+    actor: &str,
+) -> Result<serde_json::Value> {
+    let key = args
+        .get("id")
+        .or_else(|| args.get("name"))
+        .or_else(|| args.get("path"))
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("missing required argument: id|name|path"))?;
+    let deleted = service.store.delete_webhook_route(key).await?;
+    let _ = service
+        .store
+        .insert_audit(NewAudit {
+            group_id: None,
+            action: "WEBHOOK_ROUTE_DELETE".to_string(),
+            actor: actor.to_string(),
+            result: if deleted {
+                "SUCCESS".to_string()
+            } else {
+                "NOT_FOUND".to_string()
+            },
+            created_at: Utc::now(),
+            metadata_json: Some(json!({
+                "key": key,
+            })),
+        })
+        .await;
+    Ok(json!({
+        "tool": tool,
+        "key": key,
+        "deleted": deleted,
+    }))
+}
+
+pub(crate) async fn execute_fs_list_tool(
+    service: Arc<AppService>,
+    tool: &str,
+    args: BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
+    let group_name = required_arg(&args, "group")?;
+    let relative_path = args.get("path").map(String::as_str).unwrap_or(".");
+    let include_hidden = parse_bool_arg(&args, "include_hidden", false)?;
+    let max_entries = parse_u64_arg(&args, "max_entries", 200, 1, 2_000)? as usize;
+    let (_, group_root) = resolve_group_root(service, group_name).await?;
+    let candidate = resolve_existing_group_path(&group_root, relative_path)?;
+
+    let mut entries = Vec::new();
+    if candidate.is_dir() {
+        for entry in fs::read_dir(&candidate)
+            .with_context(|| format!("failed to read directory {}", candidate.display()))?
+        {
+            if entries.len() >= max_entries {
+                break;
+            }
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !include_hidden && name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            let kind = if metadata.is_dir() {
+                "dir"
+            } else if metadata.is_file() {
+                "file"
+            } else {
+                "other"
+            };
+            let rel = path
+                .strip_prefix(&group_root)
+                .unwrap_or(path.as_path())
+                .display()
+                .to_string();
+            entries.push(json!({
+                "name": name,
+                "path": rel,
+                "type": kind,
+                "size_bytes": if metadata.is_file() { Some(metadata.len()) } else { None },
+            }));
+        }
+        entries.sort_by(|a, b| {
+            a.get("path")
+                .and_then(|v| v.as_str())
+                .cmp(&b.get("path").and_then(|v| v.as_str()))
+        });
+    } else {
+        let metadata = fs::symlink_metadata(&candidate)?;
+        let rel = candidate
+            .strip_prefix(&group_root)
+            .unwrap_or(candidate.as_path())
+            .display()
+            .to_string();
+        entries.push(json!({
+            "name": candidate.file_name().map(|v| v.to_string_lossy().to_string()).unwrap_or_else(|| rel.clone()),
+            "path": rel,
+            "type": if metadata.is_file() { "file" } else { "other" },
+            "size_bytes": if metadata.is_file() { Some(metadata.len()) } else { None },
+        }));
+    }
+
+    Ok(json!({
+        "tool": tool,
+        "group": group_name,
+        "path": relative_path,
+        "entries": entries,
+    }))
+}
+
+pub(crate) async fn execute_fs_read_tool(
+    service: Arc<AppService>,
+    tool: &str,
+    args: BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
+    let group_name = required_arg(&args, "group")?;
+    let relative_path = required_arg(&args, "path")?;
+    let max_bytes = parse_u64_arg(&args, "max_bytes", 131_072, 256, 2_097_152)? as usize;
+    let (_, group_root) = resolve_group_root(service, group_name).await?;
+    let candidate = resolve_existing_group_path(&group_root, relative_path)?;
+    let metadata = fs::symlink_metadata(&candidate)?;
+    if !metadata.is_file() {
+        return Err(anyhow!("path is not a file: {}", relative_path));
+    }
+    let bytes = fs::read(&candidate)?;
+    let total_bytes = bytes.len();
+    let body_limit = max_bytes.min(total_bytes);
+    let preview = String::from_utf8_lossy(&bytes[..body_limit]).to_string();
+    let rel = candidate
+        .strip_prefix(&group_root)
+        .unwrap_or(candidate.as_path())
+        .display()
+        .to_string();
+    Ok(json!({
+        "tool": tool,
+        "group": group_name,
+        "path": rel,
+        "max_bytes": max_bytes,
+        "total_bytes": total_bytes,
+        "truncated": total_bytes > body_limit,
+        "content": preview,
+    }))
+}
+
+pub(crate) async fn execute_fs_grep_tool(
+    cfg: &AppConfig,
+    service: Arc<AppService>,
+    tool: &str,
+    args: BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
+    execute_grep_tool(cfg, service, tool, args).await
+}
+
+pub(crate) async fn execute_fs_edit_tool(
+    service: Arc<AppService>,
+    tool: &str,
+    args: BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
+    let group_name = required_arg(&args, "group")?;
+    let relative_path = required_arg(&args, "path")?;
+    let content = required_arg(&args, "content")?;
+    let mode = args
+        .get("mode")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "overwrite".to_string());
+    let (_, group_root) = resolve_group_root(service, group_name).await?;
+    let target = resolve_writable_group_file_path(&group_root, relative_path)?;
+
+    let bytes_written = match mode.as_str() {
+        "overwrite" => {
+            fs::write(&target, content.as_bytes())
+                .with_context(|| format!("failed to write {}", target.display()))?;
+            content.len()
+        }
+        "append" => {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&target)
+                .with_context(|| format!("failed to open {}", target.display()))?;
+            file.write_all(content.as_bytes())
+                .with_context(|| format!("failed to append {}", target.display()))?;
+            content.len()
+        }
+        _ => {
+            return Err(anyhow!(
+                "invalid mode '{}'; expected overwrite or append",
+                mode
+            ));
+        }
+    };
+
+    let rel = target
+        .strip_prefix(&group_root)
+        .unwrap_or(target.as_path())
+        .display()
+        .to_string();
+    Ok(json!({
+        "tool": tool,
+        "group": group_name,
+        "path": rel,
+        "mode": mode,
+        "bytes_written": bytes_written,
+    }))
+}
+
+pub(crate) fn read_file_tail(path: &Path, max_bytes: usize) -> String {
+    let Ok(bytes) = fs::read(path) else {
+        return String::new();
+    };
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let start = bytes.len().saturating_sub(max_bytes);
+    String::from_utf8_lossy(&bytes[start..]).to_string()
+}
+
+pub(crate) async fn execute_proc_start_tool(
+    service: Arc<AppService>,
+    tool: &str,
+    args: BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
+    let group_name = required_arg(&args, "group")?;
+    let command = required_arg(&args, "command")?.trim();
+    if command.is_empty() {
+        return Err(anyhow!("command must not be empty"));
+    }
+
+    let (_, group_root) = resolve_group_root(service, group_name).await?;
+    let id = maid_core::new_id();
+    let proc_dir = group_root.join(".maid").join("processes");
+    fs::create_dir_all(&proc_dir)
+        .with_context(|| format!("failed to create {}", proc_dir.display()))?;
+    let stdout_path = proc_dir.join(format!("{id}.stdout.log"));
+    let stderr_path = proc_dir.join(format!("{id}.stderr.log"));
+    let stdout_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stdout_path)
+        .with_context(|| format!("failed to open {}", stdout_path.display()))?;
+    let stderr_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_path)
+        .with_context(|| format!("failed to open {}", stderr_path.display()))?;
+
+    let mut child_cmd = if cfg!(target_os = "windows") {
+        let mut cmd = tokio::process::Command::new("cmd");
+        cmd.arg("/C").arg(command);
+        cmd
+    } else {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut cmd = tokio::process::Command::new(shell);
+        cmd.arg("-lc").arg(command);
+        cmd
+    };
+    child_cmd
+        .current_dir(&group_root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout_file))
+        .stderr(std::process::Stdio::from(stderr_file));
+    let child = child_cmd
+        .spawn()
+        .with_context(|| format!("failed to start process in {}", group_root.display()))?;
+    let pid = child.id();
+    let started_at = Utc::now();
+
+    let mut registry = process_registry().lock().await;
+    registry.insert(
+        id.clone(),
+        ManagedProcess {
+            group: group_name.to_string(),
+            command: command.to_string(),
+            pid,
+            started_at,
+            stdout_path: stdout_path.clone(),
+            stderr_path: stderr_path.clone(),
+            child,
+        },
+    );
+    drop(registry);
+
+    Ok(json!({
+        "tool": tool,
+        "id": id,
+        "pid": pid,
+        "group": group_name,
+        "command": command,
+        "started_at": started_at.to_rfc3339(),
+        "stdout_log": stdout_path.display().to_string(),
+        "stderr_log": stderr_path.display().to_string(),
+    }))
+}
+
+pub(crate) async fn execute_proc_wait_tool(
+    tool: &str,
+    args: BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
+    let id = required_arg(&args, "id")?;
+    let timeout_seconds = parse_u64_arg(&args, "timeout_seconds", 0, 0, 86_400)?;
+    let max_bytes = parse_u64_arg(&args, "max_bytes", 4_096, 256, 131_072)? as usize;
+    let remove_on_exit = parse_bool_arg(&args, "remove_on_exit", false)?;
+
+    let mut registry = process_registry().lock().await;
+    let Some(entry) = registry.get_mut(id) else {
+        return Err(anyhow!("process not found: {}", id));
+    };
+
+    let stdout_path = entry.stdout_path.clone();
+    let stderr_path = entry.stderr_path.clone();
+    let status = if timeout_seconds == 0 {
+        entry.child.try_wait()?
+    } else {
+        match tokio::time::timeout(Duration::from_secs(timeout_seconds), entry.child.wait()).await {
+            Ok(waited) => Some(waited?),
+            Err(_) => None,
+        }
+    };
+
+    let running = status.is_none();
+    let exit_code = status.and_then(|v| v.code());
+    if !running && remove_on_exit {
+        registry.remove(id);
+    }
+    drop(registry);
+
+    Ok(json!({
+        "tool": tool,
+        "id": id,
+        "running": running,
+        "exit_code": exit_code,
+        "stdout_tail": read_file_tail(&stdout_path, max_bytes),
+        "stderr_tail": read_file_tail(&stderr_path, max_bytes),
+    }))
+}
+
+pub(crate) async fn execute_proc_kill_tool(
+    tool: &str,
+    args: BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
+    let id = required_arg(&args, "id")?;
+    let mut registry = process_registry().lock().await;
+    let Some(entry) = registry.get_mut(id) else {
+        return Err(anyhow!("process not found: {}", id));
+    };
+
+    let already_exited = entry.child.try_wait()?.is_some();
+    if !already_exited {
+        entry
+            .child
+            .kill()
+            .await
+            .with_context(|| format!("failed to kill process {}", id))?;
+    }
+    let status = entry.child.try_wait()?;
+
+    Ok(json!({
+        "tool": tool,
+        "id": id,
+        "killed": !already_exited,
+        "running": status.is_none(),
+        "exit_code": status.and_then(|v| v.code()),
+    }))
+}
+
+pub(crate) async fn execute_proc_logs_tool(
+    tool: &str,
+    args: BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
+    let id = required_arg(&args, "id")?;
+    let max_bytes = parse_u64_arg(&args, "max_bytes", 4_096, 256, 131_072)? as usize;
+    let mut registry = process_registry().lock().await;
+    let Some(entry) = registry.get_mut(id) else {
+        return Err(anyhow!("process not found: {}", id));
+    };
+    let running = entry.child.try_wait()?.is_none();
+    let stdout_path = entry.stdout_path.clone();
+    let stderr_path = entry.stderr_path.clone();
+    let group = entry.group.clone();
+    let command = entry.command.clone();
+    let pid = entry.pid;
+    let started_at = entry.started_at.to_rfc3339();
+    drop(registry);
+
+    Ok(json!({
+        "tool": tool,
+        "id": id,
+        "group": group,
+        "command": command,
+        "pid": pid,
+        "started_at": started_at,
+        "running": running,
+        "stdout_tail": read_file_tail(&stdout_path, max_bytes),
+        "stderr_tail": read_file_tail(&stderr_path, max_bytes),
+    }))
 }
 
 pub(crate) async fn execute_web_fetch_tool(
@@ -1377,19 +2063,21 @@ pub(crate) fn skill_index_tokens(entry: &SkillRegistryEntry) -> Vec<String> {
         Some(entry.id.as_str()),
         entry.name.as_deref(),
         entry.description.as_deref(),
-    ] {
-        if let Some(value) = value {
-            for token in tokenize_skill_text(value) {
-                tokens.insert(token);
-            }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for token in tokenize_skill_text(value) {
+            tokens.insert(token);
         }
     }
-    for values in [&entry.tags, &entry.intents, &entry.capabilities] {
-        if let Some(values) = values {
-            for value in values {
-                for token in tokenize_skill_text(value) {
-                    tokens.insert(token);
-                }
+    for values in [&entry.tags, &entry.intents, &entry.capabilities]
+        .into_iter()
+        .flatten()
+    {
+        for value in values {
+            for token in tokenize_skill_text(value) {
+                tokens.insert(token);
             }
         }
     }
@@ -2028,6 +2716,19 @@ pub(crate) fn format_tool_call_args(tool: &str, args: &BTreeMap<String, String>)
         "ops.search" => &["query", "limit"],
         "ops.web_fetch" => &["url"],
         "ops.grep" => &["group", "pattern", "path"],
+        "fs.list" => &["group", "path", "max_entries"],
+        "fs.read" => &["group", "path", "max_bytes"],
+        "fs.grep" => &["group", "pattern", "path"],
+        "fs.edit" => &["group", "path", "mode"],
+        "proc.start" => &["group", "command"],
+        "proc.wait" => &["id", "timeout_seconds"],
+        "proc.kill" => &["id"],
+        "proc.logs" => &["id", "max_bytes"],
+        "session.history" => &["group", "limit"],
+        "session.send" => &["from_group", "to_group", "group"],
+        "session.spawn" => &["name", "group"],
+        "webhook.register" => &["name", "path", "group", "task_id"],
+        "webhook.delete" => &["id", "name", "path"],
         "ops.code_analysis.latest" => &["group", "workflow_id", "top_n", "include_markdown"],
         "ops.code_analysis.list" => &["group", "limit"],
         "task.list" => &["group"],
@@ -2110,6 +2811,22 @@ pub(crate) fn summarize_tool_payload(tool: &str, payload: &serde_json::Value) ->
             .get("matches")
             .and_then(|v| v.as_array())
             .map(|items| format!("matches={}", items.len())),
+        "fs.list" => payload
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .map(|items| format!("entries={}", items.len())),
+        "fs.grep" => payload
+            .get("matches")
+            .and_then(|v| v.as_array())
+            .map(|items| format!("matches={}", items.len())),
+        "webhook.list" => payload
+            .get("routes")
+            .and_then(|v| v.as_array())
+            .map(|items| format!("routes={}", items.len())),
+        "session.list" => payload
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .map(|items| format!("sessions={}", items.len())),
         "ops.code_analysis.latest" => payload
             .get("top_findings")
             .and_then(|v| v.as_array())
@@ -2739,6 +3456,21 @@ pub(crate) fn supported_tool_names() -> &'static [&'static str] {
         "task.delete",
         "task.clear_group",
         "task.clear_all",
+        "session.list",
+        "session.history",
+        "session.send",
+        "session.spawn",
+        "webhook.register",
+        "webhook.list",
+        "webhook.delete",
+        "fs.list",
+        "fs.read",
+        "fs.grep",
+        "fs.edit",
+        "proc.start",
+        "proc.wait",
+        "proc.kill",
+        "proc.logs",
         "ops.web_fetch",
         "ops.search",
         "ops.grep",
@@ -2795,6 +3527,23 @@ pub(crate) fn tool_summary(name: &str) -> Option<&'static str> {
         "task.delete" => Some("Delete task; args: id"),
         "task.clear_group" => Some("Clear group tasks; args: group"),
         "task.clear_all" => Some("Clear all tasks"),
+        "session.list" => Some("List sessions/groups"),
+        "session.history" => Some("Get session history; args: group,[limit]"),
+        "session.send" => Some("Send prompt to another session; args: to_group,prompt,[from_group]"),
+        "session.spawn" => Some("Create or get session group; args: name"),
+        "webhook.register" => Some(
+            "Register webhook trigger; args: name,path,group,[task_id],[prompt],[token],[enabled]",
+        ),
+        "webhook.list" => Some("List webhook routes; args: [include_disabled]"),
+        "webhook.delete" => Some("Delete webhook route; args: id|name|path"),
+        "fs.list" => Some("List files under group root; args: group,[path],[include_hidden]"),
+        "fs.read" => Some("Read file under group root; args: group,path,[max_bytes]"),
+        "fs.grep" => Some("Search files under group root; args: group,pattern,[path],[ignore_case]"),
+        "fs.edit" => Some("Edit file under group root; args: group,path,content,[mode]"),
+        "proc.start" => Some("Start long-running process; args: group,command"),
+        "proc.wait" => Some("Wait/poll process status; args: id,[timeout_seconds],[remove_on_exit]"),
+        "proc.kill" => Some("Terminate process; args: id"),
+        "proc.logs" => Some("Read process logs; args: id,[max_bytes]"),
         "ops.web_fetch" => Some("Fetch URL; args: url,[timeout_seconds],[max_bytes]"),
         "ops.search" => Some("Web search; args: query,[limit],[timeout_seconds]"),
         "ops.grep" => Some("Search files in group root; args: group,pattern,[path],[ignore_case]"),

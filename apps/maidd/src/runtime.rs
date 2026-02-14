@@ -235,8 +235,8 @@ pub(crate) async fn run_gateway(
     };
 
     if cfg.telegram.is_some() {
-        let serve_task = run_serve(cfg, store, service, Some(events.clone()));
-        let control_task = run_gateway_control_plane(port, status, events.clone());
+        let serve_task = run_serve(cfg, store, service.clone(), Some(events.clone()));
+        let control_task = run_gateway_control_plane(port, status, events.clone(), service.clone());
         let (serve_result, control_result) = tokio::join!(serve_task, control_task);
         serve_result?;
         control_result?;
@@ -246,7 +246,7 @@ pub(crate) async fn run_gateway(
     let scheduler_executor =
         build_scheduler_executor(cfg, store.clone(), service.clone(), Some(events.clone()))?;
     let scheduler_task = run_scheduler_daemon(cfg, store.clone(), scheduler_executor);
-    let control_task = run_gateway_control_plane(port, status, events);
+    let control_task = run_gateway_control_plane(port, status, events, service.clone());
     let (scheduler_result, control_result) = tokio::join!(scheduler_task, control_task);
     scheduler_result?;
     control_result?;
@@ -257,6 +257,7 @@ async fn run_gateway_control_plane(
     port: u16,
     status: GatewayStatus,
     events: GatewayEvents,
+    service: Arc<AppService>,
 ) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))
         .await
@@ -272,8 +273,9 @@ async fn run_gateway_control_plane(
                 let (stream, addr) = accepted.context("gateway accept failed")?;
                 let status_clone = status.clone();
                 let events_clone = events.clone();
+                let service_clone = service.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_gateway_client(stream, status_clone, events_clone).await {
+                    if let Err(err) = handle_gateway_client(stream, status_clone, events_clone, service_clone).await {
                         warn!("gateway client {} failed: {err:#}", addr);
                     }
                 });
@@ -339,16 +341,28 @@ async fn handle_dashboard_client(
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("/");
 
-    let mut header_line = String::new();
-    loop {
-        header_line.clear();
-        if reader.read_line(&mut header_line).await? == 0 {
-            break;
-        }
-        let trimmed = header_line.trim_end();
-        if trimmed.is_empty() {
-            break;
-        }
+    let headers = read_http_headers(&mut reader).await?;
+    let content_length = headers
+        .get("content-length")
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(0);
+    if content_length > 1_048_576 {
+        write_http_response(
+            &mut write_half,
+            "413 Payload Too Large",
+            "application/json",
+            serde_json::to_string_pretty(&json!({
+                "ok": false,
+                "error": "payload_too_large",
+                "max_bytes": 1_048_576,
+            }))?,
+        )
+        .await?;
+        return Ok(());
+    }
+    let mut body = vec![0_u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body).await?;
     }
 
     let (path, query) = parse_http_target(target)?;
@@ -357,6 +371,15 @@ async fn handle_dashboard_client(
             let body = dashboard_html();
             write_http_response(&mut write_half, "200 OK", "text/html; charset=utf-8", body)
                 .await?;
+        }
+        ("GET", "/assets/tailwind.css") => {
+            write_http_response(
+                &mut write_half,
+                "200 OK",
+                "text/css; charset=utf-8",
+                dashboard_tailwind_css().to_string(),
+            )
+            .await?;
         }
         ("GET", "/health") => {
             let body = serde_json::to_string_pretty(&build_health_snapshot(&cfg).await?)?;
@@ -404,6 +427,88 @@ async fn handle_dashboard_client(
                     })
                 })
                 .collect::<Vec<_>>();
+            write_http_response(
+                &mut write_half,
+                "200 OK",
+                "application/json",
+                serde_json::to_string_pretty(&payload)?,
+            )
+            .await?;
+        }
+        (method, path) if parse_dashboard_plugin_api_route(method, path).is_some() => {
+            let route = parse_dashboard_plugin_api_route(method, path).expect("route is checked");
+
+            let parsed = if route.expects_body {
+                match parse_dashboard_plugin_body(&body) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        write_http_response(
+                            &mut write_half,
+                            "400 Bad Request",
+                            "application/json",
+                            serde_json::to_string_pretty(&json!({
+                                "ok": false,
+                                "error": format!("{err:#}"),
+                            }))?,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                DashboardPluginBody::default()
+            };
+
+            let command = match route.command {
+                Some(ref value) => value.clone(),
+                None => parsed
+                    .command
+                    .clone()
+                    .unwrap_or_else(|| "execute".to_string())
+                    .trim()
+                    .to_string(),
+            };
+            if command.is_empty() {
+                write_http_response(
+                    &mut write_half,
+                    "400 Bad Request",
+                    "application/json",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": false,
+                        "error": "missing command in request body",
+                    }))?,
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let payload = match run_dashboard_plugin_command(
+                &cfg,
+                &config_path,
+                store.clone(),
+                &route.plugin,
+                &command,
+                parsed.args,
+                parsed.input,
+                "dashboard-api",
+            )
+            .await
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    write_http_response(
+                        &mut write_half,
+                        "400 Bad Request",
+                        "application/json",
+                        serde_json::to_string_pretty(&json!({
+                            "ok": false,
+                            "error": format!("{err:#}"),
+                        }))?,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
             write_http_response(
                 &mut write_half,
                 "200 OK",
@@ -799,7 +904,13 @@ fn dashboard_tool_supports_default_group(tool: &str) -> bool {
             | "task.list"
             | "task.create"
             | "task.clear_group"
+            | "session.history"
             | "ops.grep"
+            | "fs.list"
+            | "fs.read"
+            | "fs.grep"
+            | "fs.edit"
+            | "proc.start"
             | "ops.code_analysis.latest"
             | "ops.code_analysis.list"
     )
@@ -817,8 +928,171 @@ Commands (prefix with /):\n\
 - /task.pause id=<task_id>\n\
 - /task.resume id=<task_id>\n\
 - /group.list\n\
+- /session.list\n\
+- /session.history group=main limit=20\n\
+- /webhook.list\n\
+- /fs.list path=.\n\
 - /ops.search query=latest+rust+release limit=3\n\n\
 Tip: /task list maps to /task.list automatically."
+}
+
+#[derive(Debug, Clone)]
+struct DashboardPluginApiRoute {
+    plugin: String,
+    command: Option<String>,
+    expects_body: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct DashboardPluginBody {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: BTreeMap<String, String>,
+    #[serde(default)]
+    input: Option<String>,
+}
+
+fn parse_dashboard_plugin_api_route(method: &str, path: &str) -> Option<DashboardPluginApiRoute> {
+    let suffix = path.strip_prefix("/api/plugins/")?;
+    let segments = suffix
+        .split('/')
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>();
+
+    match segments.as_slice() {
+        [plugin, "describe"] if method.eq_ignore_ascii_case("GET") => {
+            Some(DashboardPluginApiRoute {
+                plugin: (*plugin).to_string(),
+                command: Some("describe".to_string()),
+                expects_body: false,
+            })
+        }
+        [plugin, "execute"] if method.eq_ignore_ascii_case("POST") => {
+            Some(DashboardPluginApiRoute {
+                plugin: (*plugin).to_string(),
+                command: None,
+                expects_body: true,
+            })
+        }
+        [plugin, "command", command] if method.eq_ignore_ascii_case("POST") => {
+            Some(DashboardPluginApiRoute {
+                plugin: (*plugin).to_string(),
+                command: Some((*command).to_string()),
+                expects_body: true,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_dashboard_plugin_body(raw: &[u8]) -> Result<DashboardPluginBody> {
+    if raw.is_empty() {
+        return Ok(DashboardPluginBody::default());
+    }
+
+    serde_json::from_slice::<DashboardPluginBody>(raw)
+        .context("invalid JSON body, expected {\"command\"?,\"args\"?,\"input\"?}")
+}
+
+async fn run_dashboard_plugin_command(
+    cfg: &AppConfig,
+    config_path: &Path,
+    store: Arc<SqliteStore>,
+    plugin_name: &str,
+    command: &str,
+    args: BTreeMap<String, String>,
+    input: Option<String>,
+    actor: &str,
+) -> Result<serde_json::Value> {
+    validate_plugin_name(plugin_name)?;
+    let live_cfg = AppConfig::load(config_path).unwrap_or_else(|_| cfg.clone());
+    ensure_plugin_enabled(&live_cfg, plugin_name)?;
+    let plugins_dir = resolve_plugins_dir(&live_cfg, None);
+    let plugin = load_plugin(&plugins_dir, plugin_name).with_context(|| {
+        format!(
+            "plugin '{}' not found in {}",
+            plugin_name,
+            plugins_dir.display()
+        )
+    })?;
+    enforce_plugin_signature_policy(&live_cfg, &plugin, false)?;
+
+    let bridge = create_plugin_tool_bridge_session(&live_cfg, &plugin)?;
+    let mut extra_env = vec![
+        ("MAID_CONFIG".to_string(), config_path.display().to_string()),
+        ("MAID_PLUGIN_NAME".to_string(), plugin.manifest.name.clone()),
+    ];
+    if let Ok(exe) = std::env::current_exe() {
+        extra_env.push(("MAID_BIN".to_string(), exe.display().to_string()));
+    }
+    if let Some(session) = &bridge {
+        extra_env.push((
+            "MAID_PLUGIN_TOOL_SESSION".to_string(),
+            session.path.display().to_string(),
+        ));
+        extra_env.push(("MAID_PLUGIN_TOOL_TOKEN".to_string(), session.token.clone()));
+    }
+
+    let request = PluginRequest {
+        command: command.to_string(),
+        args,
+        input,
+        context: PluginContext {
+            actor: actor.to_string(),
+            cwd: std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .display()
+                .to_string(),
+        },
+    };
+
+    let started = Instant::now();
+    let run_result = run_plugin_with_env(&plugin, request, &extra_env).await;
+    if let Some(session) = bridge {
+        let _ = std::fs::remove_file(&session.path);
+    }
+    let latency_ms = started.elapsed().as_millis() as i64;
+
+    if let Err(err) = &run_result {
+        store
+            .record_plugin_invocation(NewPluginInvocation {
+                plugin_name: &plugin.manifest.name,
+                plugin_version: &plugin.manifest.version,
+                command,
+                actor,
+                ok: false,
+                latency_ms,
+                created_at: Utc::now(),
+            })
+            .await
+            .ok();
+        return Err(anyhow!("{err:#}"));
+    }
+
+    let response = run_result?;
+    store
+        .record_plugin_invocation(NewPluginInvocation {
+            plugin_name: &plugin.manifest.name,
+            plugin_version: &plugin.manifest.version,
+            command,
+            actor,
+            ok: response.ok,
+            latency_ms,
+            created_at: Utc::now(),
+        })
+        .await
+        .ok();
+
+    Ok(json!({
+        "ok": response.ok,
+        "plugin": plugin.manifest.name,
+        "version": plugin.manifest.version,
+        "command": command,
+        "message": response.message,
+        "output": response.output,
+        "data": response.data
+    }))
 }
 
 pub(crate) async fn run_health_checks(
@@ -975,21 +1249,117 @@ fn dashboard_html() -> String {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>maid control dashboard</title>
+  <link rel="stylesheet" href="/assets/tailwind.css" />
   <style>
     :root {
-      --bg: #f3f3f3;
-      --bg-elev: #ffffff;
+      color-scheme: light dark;
+      --bg-spot-1: rgba(0, 0, 0, 0.06);
+      --bg-spot-2: rgba(0, 0, 0, 0.05);
+      --bg-1: #fcfcfc;
+      --bg-2: #f1f1f1;
+      --bg-3: #ededed;
       --panel: rgba(255, 255, 255, 0.96);
       --panel-border: rgba(0, 0, 0, 0.14);
+      --panel-head-bg: linear-gradient(180deg, rgba(0, 0, 0, 0.07), rgba(0, 0, 0, 0));
       --text: #0f0f0f;
+      --text-strong: #111111;
       --muted: #4d4d4d;
       --line: rgba(0, 0, 0, 0.14);
-      --ok: #0f0f0f;
-      --warn: #1f1f1f;
-      --err: #000000;
-      --accent: #000000;
-      --accent-strong: #000000;
+      --pill-bg: rgba(0, 0, 0, 0.04);
+      --pill-ok-text: #111111;
+      --pill-ok-border: rgba(0, 0, 0, 0.36);
+      --pill-ok-bg: rgba(0, 0, 0, 0.08);
+      --pill-err-text: #ffffff;
+      --pill-err-border: rgba(0, 0, 0, 0.88);
+      --pill-err-bg: rgba(0, 0, 0, 0.9);
+      --btn-border: rgba(0, 0, 0, 0.82);
+      --btn-hover-border: rgba(0, 0, 0, 1);
+      --btn-top: rgba(0, 0, 0, 0.9);
+      --btn-bottom: rgba(0, 0, 0, 0.82);
+      --btn-warn-border: rgba(0, 0, 0, 0.7);
+      --btn-warn-top: rgba(34, 34, 34, 0.9);
+      --btn-warn-bottom: rgba(34, 34, 34, 0.8);
+      --btn-danger-border: rgba(0, 0, 0, 1);
+      --btn-danger-top: rgba(0, 0, 0, 1);
+      --btn-danger-bottom: rgba(0, 0, 0, 0.92);
+      --btn-text: #ffffff;
+      --th-bg: rgba(245, 245, 245, 0.98);
+      --mono: #222222;
+      --chip-bg: rgba(0, 0, 0, 0.06);
+      --chip-text: #1a1a1a;
+      --chip-active-border: rgba(0, 0, 0, 0.52);
+      --chip-active-bg: rgba(0, 0, 0, 0.12);
+      --chip-running-border: rgba(0, 0, 0, 0.42);
+      --chip-running-bg: rgba(0, 0, 0, 0.09);
+      --chip-bad-border: rgba(0, 0, 0, 0.76);
+      --chip-bad-bg: rgba(0, 0, 0, 0.78);
+      --chip-bad-text: #ffffff;
+      --plugin-bg: rgba(0, 0, 0, 0.03);
+      --field-bg: rgba(255, 255, 255, 0.98);
+      --assistant-log-bg: rgba(0, 0, 0, 0.03);
+      --assistant-msg-bg: rgba(255, 255, 255, 1);
+      --assistant-user-bg: rgba(0, 0, 0, 0.92);
+      --assistant-user-border: rgba(0, 0, 0, 0.82);
+      --assistant-user-text: #ffffff;
+      --assistant-error-bg: rgba(0, 0, 0, 0.14);
+      --assistant-error-border: rgba(0, 0, 0, 0.75);
       --shadow: 0 14px 32px rgba(0, 0, 0, 0.08);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-spot-1: rgba(255, 255, 255, 0.04);
+        --bg-spot-2: rgba(255, 255, 255, 0.025);
+        --bg-1: #050505;
+        --bg-2: #0a0a0a;
+        --bg-3: #0f0f10;
+        --panel: rgba(12, 12, 13, 0.95);
+        --panel-border: rgba(255, 255, 255, 0.14);
+        --panel-head-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0));
+        --text: #ececec;
+        --text-strong: #ffffff;
+        --muted: #b7b7b9;
+        --line: rgba(255, 255, 255, 0.14);
+        --pill-bg: rgba(255, 255, 255, 0.08);
+        --pill-ok-text: #ffffff;
+        --pill-ok-border: rgba(255, 255, 255, 0.28);
+        --pill-ok-bg: rgba(255, 255, 255, 0.12);
+        --pill-err-text: #ffffff;
+        --pill-err-border: rgba(255, 255, 255, 0.45);
+        --pill-err-bg: rgba(255, 255, 255, 0.2);
+        --btn-border: rgba(255, 255, 255, 0.26);
+        --btn-hover-border: rgba(255, 255, 255, 0.44);
+        --btn-top: rgba(38, 38, 40, 0.98);
+        --btn-bottom: rgba(22, 22, 24, 0.98);
+        --btn-warn-border: rgba(255, 255, 255, 0.34);
+        --btn-warn-top: rgba(64, 64, 66, 0.98);
+        --btn-warn-bottom: rgba(46, 46, 48, 0.98);
+        --btn-danger-border: rgba(255, 255, 255, 0.38);
+        --btn-danger-top: rgba(74, 74, 76, 0.98);
+        --btn-danger-bottom: rgba(54, 54, 56, 0.98);
+        --btn-text: #ffffff;
+        --th-bg: rgba(17, 17, 18, 0.98);
+        --mono: #d0d0d2;
+        --chip-bg: rgba(255, 255, 255, 0.1);
+        --chip-text: #efefef;
+        --chip-active-border: rgba(255, 255, 255, 0.24);
+        --chip-active-bg: rgba(255, 255, 255, 0.16);
+        --chip-running-border: rgba(255, 255, 255, 0.2);
+        --chip-running-bg: rgba(255, 255, 255, 0.13);
+        --chip-bad-border: rgba(255, 255, 255, 0.42);
+        --chip-bad-bg: rgba(255, 255, 255, 0.22);
+        --chip-bad-text: #ffffff;
+        --plugin-bg: rgba(255, 255, 255, 0.04);
+        --field-bg: rgba(5, 5, 6, 0.92);
+        --assistant-log-bg: rgba(255, 255, 255, 0.04);
+        --assistant-msg-bg: rgba(16, 16, 17, 0.92);
+        --assistant-user-bg: rgba(255, 255, 255, 0.12);
+        --assistant-user-border: rgba(255, 255, 255, 0.22);
+        --assistant-user-text: #ffffff;
+        --assistant-error-bg: rgba(255, 255, 255, 0.16);
+        --assistant-error-border: rgba(255, 255, 255, 0.3);
+        --shadow: 0 16px 36px rgba(0, 0, 0, 0.36);
+      }
     }
 
     * { box-sizing: border-box; }
@@ -999,9 +1369,9 @@ fn dashboard_html() -> String {
       font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
       color: var(--text);
       background:
-        radial-gradient(circle at 0% -10%, rgba(0, 0, 0, 0.06), transparent 40%),
-        radial-gradient(circle at 100% 0%, rgba(0, 0, 0, 0.05), transparent 36%),
-        linear-gradient(145deg, #fcfcfc 0%, #f1f1f1 54%, #ededed 100%);
+        radial-gradient(circle at 0% -10%, var(--bg-spot-1), transparent 40%),
+        radial-gradient(circle at 100% 0%, var(--bg-spot-2), transparent 36%),
+        linear-gradient(145deg, var(--bg-1) 0%, var(--bg-2) 54%, var(--bg-3) 100%);
       min-height: 100vh;
     }
 
@@ -1042,6 +1412,20 @@ fn dashboard_html() -> String {
       font-size: 14px;
     }
 
+    .quickstart {
+      margin: 0 0 14px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      color: var(--muted);
+      font: 600 12px/1.45 "IBM Plex Mono", "Fira Code", monospace;
+      letter-spacing: 0.02em;
+    }
+
+    .quickstart strong { color: var(--text-strong); }
+
     .controls {
       display: flex;
       align-items: center;
@@ -1054,45 +1438,56 @@ fn dashboard_html() -> String {
       border-radius: 999px;
       padding: 8px 10px;
       border: 1px solid var(--line);
-      background: rgba(0, 0, 0, 0.04);
+      background: var(--pill-bg);
       color: var(--muted);
       text-transform: uppercase;
       letter-spacing: 0.08em;
     }
 
     .pill.ok {
-      color: #111111;
-      border-color: rgba(0, 0, 0, 0.36);
-      background: rgba(0, 0, 0, 0.08);
+      color: var(--pill-ok-text);
+      border-color: var(--pill-ok-border);
+      background: var(--pill-ok-bg);
     }
 
     .pill.err {
-      color: #ffffff;
-      border-color: rgba(0, 0, 0, 0.88);
-      background: rgba(0, 0, 0, 0.9);
+      color: var(--pill-err-text);
+      border-color: var(--pill-err-border);
+      background: var(--pill-err-bg);
     }
 
     .btn {
-      border: 1px solid rgba(0, 0, 0, 0.82);
-      background: linear-gradient(180deg, rgba(0, 0, 0, 0.9), rgba(0, 0, 0, 0.82));
-      color: #ffffff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      vertical-align: middle;
+      white-space: nowrap;
+      min-height: 34px;
+      border: 1px solid var(--btn-border);
+      background: linear-gradient(180deg, var(--btn-top), var(--btn-bottom));
+      color: var(--btn-text);
       border-radius: 10px;
       padding: 8px 12px;
       font: 700 13px/1 "IBM Plex Mono", "Fira Code", monospace;
       cursor: pointer;
-      transition: transform 120ms ease, border-color 120ms ease;
+      transition: border-color 120ms ease, opacity 120ms ease;
+      text-decoration: none;
     }
 
-    .btn:hover { transform: translateY(-1px); border-color: rgba(0, 0, 0, 1); }
-    .btn:disabled { opacity: 0.5; cursor: wait; transform: none; }
-    .btn.small { padding: 6px 8px; font-size: 11px; }
+    .btn:hover { border-color: var(--btn-hover-border); }
+    .btn:disabled { opacity: 0.5; cursor: wait; }
+    .btn.small { min-height: 28px; padding: 6px 8px; font-size: 11px; }
+    .btn.ghost {
+      background: transparent;
+      color: var(--text);
+    }
     .btn.warn {
-      border-color: rgba(0, 0, 0, 0.7);
-      background: linear-gradient(180deg, rgba(34, 34, 34, 0.9), rgba(34, 34, 34, 0.8));
+      border-color: var(--btn-warn-border);
+      background: linear-gradient(180deg, var(--btn-warn-top), var(--btn-warn-bottom));
     }
     .btn.danger {
-      border-color: rgba(0, 0, 0, 1);
-      background: linear-gradient(180deg, rgba(0, 0, 0, 1), rgba(0, 0, 0, 0.92));
+      border-color: var(--btn-danger-border);
+      background: linear-gradient(180deg, var(--btn-danger-top), var(--btn-danger-bottom));
     }
 
     .stamp {
@@ -1157,7 +1552,7 @@ fn dashboard_html() -> String {
       gap: 8px;
       padding: 12px 14px;
       border-bottom: 1px solid var(--line);
-      background: linear-gradient(180deg, rgba(0, 0, 0, 0.07), rgba(0, 0, 0, 0));
+      background: var(--panel-head-bg);
     }
 
     .panel h2 {
@@ -1166,7 +1561,7 @@ fn dashboard_html() -> String {
       letter-spacing: 0.05em;
       text-transform: uppercase;
       font-family: "IBM Plex Mono", "Fira Code", monospace;
-      color: #111111;
+      color: var(--text-strong);
     }
 
     .meta {
@@ -1202,14 +1597,14 @@ fn dashboard_html() -> String {
       letter-spacing: 0.08em;
       position: sticky;
       top: 0;
-      background: rgba(245, 245, 245, 0.98);
+      background: var(--th-bg);
       z-index: 1;
     }
 
     .mono {
       font-family: "IBM Plex Mono", "Fira Code", monospace;
       font-size: 12px;
-      color: #222222;
+      color: var(--mono);
     }
 
     .status {
@@ -1220,18 +1615,18 @@ fn dashboard_html() -> String {
       font: 700 11px/1 "IBM Plex Mono", "Fira Code", monospace;
       letter-spacing: 0.06em;
       text-transform: uppercase;
-      background: rgba(0, 0, 0, 0.06);
-      color: #1a1a1a;
+      background: var(--chip-bg);
+      color: var(--chip-text);
       white-space: nowrap;
     }
 
     .status.active,
     .status.succeeded,
-    .status.approved { border-color: rgba(0, 0, 0, 0.52); color: #111111; background: rgba(0, 0, 0, 0.12); }
+    .status.approved { border-color: var(--chip-active-border); color: var(--chip-text); background: var(--chip-active-bg); }
     .status.running,
-    .status.pending { border-color: rgba(0, 0, 0, 0.42); color: #111111; background: rgba(0, 0, 0, 0.09); }
+    .status.pending { border-color: var(--chip-running-border); color: var(--chip-text); background: var(--chip-running-bg); }
     .status.paused,
-    .status.failed { border-color: rgba(0, 0, 0, 0.76); color: #ffffff; background: rgba(0, 0, 0, 0.78); }
+    .status.failed { border-color: var(--chip-bad-border); color: var(--chip-bad-text); background: var(--chip-bad-bg); }
 
     .plugin-list {
       display: grid;
@@ -1245,7 +1640,7 @@ fn dashboard_html() -> String {
       border: 1px solid var(--line);
       border-radius: 12px;
       padding: 10px;
-      background: rgba(0, 0, 0, 0.03);
+      background: var(--plugin-bg);
     }
 
     .plugin-head {
@@ -1273,6 +1668,7 @@ fn dashboard_html() -> String {
     .actions {
       display: flex;
       flex-wrap: wrap;
+      align-items: center;
       gap: 6px;
     }
 
@@ -1298,13 +1694,32 @@ fn dashboard_html() -> String {
       letter-spacing: 0.05em;
     }
 
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+
+    .field-label {
+      font-size: 12px;
+      color: var(--muted);
+      font-family: "IBM Plex Mono", "Fira Code", monospace;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .hint {
+      margin: 0;
+      color: var(--muted);
+      font: 500 12px/1.45 "IBM Plex Mono", "Fira Code", monospace;
+    }
+
     .form input,
     .form select,
     .form textarea {
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 10px;
-      background: rgba(255, 255, 255, 0.98);
+      background: var(--field-bg);
       color: var(--text);
       font: 500 13px/1.4 "IBM Plex Sans", "Avenir Next", sans-serif;
       padding: 8px 10px;
@@ -1322,30 +1737,30 @@ fn dashboard_html() -> String {
       gap: 8px;
       max-height: 320px;
       overflow-y: auto;
-      background: rgba(0, 0, 0, 0.03);
+      background: var(--assistant-log-bg);
     }
 
     .assistant-msg {
       border: 1px solid var(--line);
       border-radius: 10px;
       padding: 8px 10px;
-      background: rgba(255, 255, 255, 1);
+      background: var(--assistant-msg-bg);
     }
 
     .assistant-msg.user {
-      border-color: rgba(0, 0, 0, 0.82);
-      background: rgba(0, 0, 0, 0.92);
-      color: #ffffff;
+      border-color: var(--assistant-user-border);
+      background: var(--assistant-user-bg);
+      color: var(--assistant-user-text);
     }
 
     .assistant-msg.user .assistant-head,
     .assistant-msg.user .assistant-body {
-      color: #ffffff;
+      color: var(--assistant-user-text);
     }
 
     .assistant-msg.error {
-      border-color: rgba(0, 0, 0, 0.75);
-      background: rgba(0, 0, 0, 0.14);
+      border-color: var(--assistant-error-border);
+      background: var(--assistant-error-bg);
     }
 
     .assistant-head {
@@ -1361,7 +1776,7 @@ fn dashboard_html() -> String {
       white-space: pre-wrap;
       word-break: break-word;
       font: 500 13px/1.45 "IBM Plex Mono", "Fira Code", monospace;
-      color: #111111;
+      color: var(--text-strong);
     }
 
     .empty {
@@ -1383,6 +1798,8 @@ fn dashboard_html() -> String {
       th, td { padding: 8px 8px; }
       table { min-width: 520px; }
       .form-grid { grid-template-columns: 1fr; }
+      .controls { width: 100%; }
+      .controls .btn { flex: 1; }
     }
   </style>
 </head>
@@ -1392,14 +1809,16 @@ fn dashboard_html() -> String {
       <div>
         <p class="eyebrow">maid</p>
         <h1>Control Dashboard</h1>
-        <p class="subtitle">Run tasks, manage plugins, and handle pairings.</p>
       </div>
       <div class="controls">
         <span id="refresh_status" class="pill">syncing</span>
-        <button id="refresh_btn" class="btn" type="button">Refresh now</button>
+        <button id="refresh_btn" class="btn" type="button">Refresh</button>
+        <a href="#task_builder" class="btn ghost" role="button">New Task</a>
+        <a href="#assistant_panel" class="btn ghost" role="button">Ask Assistant</a>
         <span id="last_refresh" class="stamp">never</span>
       </div>
     </header>
+    <p class="quickstart">Start here: build or edit tasks in <strong>Task Builder</strong>, verify status in <strong>Scheduled Tasks</strong>, and use <strong>Assistant</strong> for quick command-driven actions.</p>
 
     <section class="stats">
       <article class="stat"><p class="k">Groups</p><p class="v" id="metric_groups">-</p></article>
@@ -1411,10 +1830,10 @@ fn dashboard_html() -> String {
     </section>
 
     <section class="grid">
-      <article class="panel">
+      <article class="panel" id="assistant_panel">
         <div class="panel-head">
           <h2>Assistant</h2>
-          <span id="assistant_meta" class="meta">Natural text or /commands</span>
+          <span id="assistant_meta" class="meta">Natural text, /help, or /tool calls</span>
         </div>
         <form id="assistant_form" class="form">
           <div class="form-grid">
@@ -1422,15 +1841,16 @@ fn dashboard_html() -> String {
               Group
               <select id="assistant_group"></select>
             </label>
-            <label>
-              Send
-              <button id="assistant_send" class="btn" type="submit">Run</button>
-            </label>
+            <div class="field">
+              <span class="field-label">Run Assistant</span>
+              <button id="assistant_send" class="btn" type="submit">Send Request</button>
+            </div>
           </div>
           <label>
-            Input
-            <textarea id="assistant_input" placeholder="Ask naturally, or run /help, /task.list, /tool ops.search query=..."></textarea>
+            Prompt
+            <textarea id="assistant_input" placeholder="Example: /task.list --group main"></textarea>
           </label>
+          <p class="hint">Tip: Press Cmd/Ctrl + Enter to run the prompt.</p>
           <div class="actions">
             <button id="assistant_clear" class="btn" type="button">Clear output</button>
           </div>
@@ -1440,10 +1860,10 @@ fn dashboard_html() -> String {
         </section>
       </article>
 
-      <article class="panel wide">
+      <article class="panel wide" id="tasks_panel">
         <div class="panel-head">
           <h2>Scheduled Tasks</h2>
-          <span id="tasks_meta" class="meta">loading</span>
+          <span id="tasks_meta" class="meta">loading tasks</span>
         </div>
         <div class="table-wrap">
           <table>
@@ -1454,7 +1874,7 @@ fn dashboard_html() -> String {
                 <th>Status</th>
                 <th>Schedule</th>
                 <th>ID</th>
-                <th>Action</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody id="tasks_tbody"></tbody>
@@ -1462,9 +1882,9 @@ fn dashboard_html() -> String {
         </div>
       </article>
 
-      <article class="panel tall">
+      <article class="panel tall" id="task_builder">
         <div class="panel-head">
-          <h2>Task Composer</h2>
+          <h2>Task Builder</h2>
           <span id="task_form_mode" class="meta">create</span>
         </div>
         <form id="task_form" class="form">
@@ -2167,15 +2587,42 @@ fn dashboard_html() -> String {
     .to_string()
 }
 
+fn dashboard_tailwind_css() -> &'static str {
+    include_str!("../assets/tailwind.css")
+}
+
 async fn handle_gateway_client(
     stream: TcpStream,
     status: GatewayStatus,
     events: GatewayEvents,
+    service: Arc<AppService>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
+    let mut first_line = String::new();
+    if reader.read_line(&mut first_line).await? == 0 {
+        return Ok(());
+    }
+    let first_trimmed = first_line.trim_end_matches(['\r', '\n']).trim();
+    if first_trimmed.is_empty() {
+        return Ok(());
+    }
 
+    if first_trimmed.contains("HTTP/") {
+        return handle_gateway_http_request(
+            first_trimmed,
+            &mut reader,
+            &mut write_half,
+            &status,
+            &events,
+            service,
+        )
+        .await;
+    }
+
+    handle_gateway_command_line(first_trimmed, &status, &events, &mut write_half).await?;
+
+    let mut line = String::new();
     loop {
         line.clear();
         let read = reader.read_line(&mut line).await?;
@@ -2186,51 +2633,305 @@ async fn handle_gateway_client(
         if trimmed.is_empty() {
             continue;
         }
+        handle_gateway_command_line(trimmed, &status, &events, &mut write_half).await?;
+    }
+}
 
-        let cmd = parse_gateway_command(trimmed)?;
-        match cmd.as_str() {
-            "ping" => {
-                let payload = json!({ "ok": true, "pong": true });
-                write_half.write_all(payload.to_string().as_bytes()).await?;
-                write_half.write_all(b"\n").await?;
+async fn handle_gateway_command_line(
+    raw: &str,
+    status: &GatewayStatus,
+    events: &GatewayEvents,
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> Result<()> {
+    let cmd = parse_gateway_command(raw)?;
+    match cmd.as_str() {
+        "ping" => {
+            let payload = json!({ "ok": true, "pong": true });
+            write_half.write_all(payload.to_string().as_bytes()).await?;
+            write_half.write_all(b"\n").await?;
+        }
+        "status" => {
+            let payload = json!({ "ok": true, "status": status });
+            write_half.write_all(payload.to_string().as_bytes()).await?;
+            write_half.write_all(b"\n").await?;
+        }
+        "subscribe" => {
+            write_half
+                .write_all(
+                    json!({"ok": true, "subscribed": true})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .await?;
+            write_half.write_all(b"\n").await?;
+            let mut rx = events.subscribe();
+            loop {
+                match rx.recv().await {
+                    Ok(payload) => {
+                        write_half.write_all(payload.as_bytes()).await?;
+                        write_half.write_all(b"\n").await?;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let warning =
+                            json!({"type":"gateway.warning","message":"lagged","skipped":skipped});
+                        write_half.write_all(warning.to_string().as_bytes()).await?;
+                        write_half.write_all(b"\n").await?;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                }
             }
-            "status" => {
-                let payload = json!({ "ok": true, "status": status });
-                write_half.write_all(payload.to_string().as_bytes()).await?;
-                write_half.write_all(b"\n").await?;
+        }
+        _ => {
+            let payload = json!({ "ok": false, "error": "unknown command" });
+            write_half.write_all(payload.to_string().as_bytes()).await?;
+            write_half.write_all(b"\n").await?;
+        }
+    }
+    Ok(())
+}
+
+async fn read_http_headers(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> Result<BTreeMap<String, String>> {
+    let mut headers = BTreeMap::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await? == 0 {
+            break;
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    Ok(headers)
+}
+
+async fn handle_gateway_http_request(
+    request_line: &str,
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    status: &GatewayStatus,
+    events: &GatewayEvents,
+    service: Arc<AppService>,
+) -> Result<()> {
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("/");
+    let headers = read_http_headers(reader).await?;
+    let content_length = headers
+        .get("content-length")
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(0);
+    if content_length > 1_048_576 {
+        write_http_response(
+            write_half,
+            "413 Payload Too Large",
+            "application/json",
+            serde_json::to_string_pretty(&json!({
+                "ok": false,
+                "error": "payload_too_large",
+                "max_bytes": 1_048_576,
+            }))?,
+        )
+        .await?;
+        return Ok(());
+    }
+    let mut body = vec![0_u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body).await?;
+    }
+
+    let (path, query) = parse_http_target(target)?;
+    match (method, path.as_str()) {
+        ("GET", "/health") => {
+            write_http_response(
+                write_half,
+                "200 OK",
+                "application/json",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "status": status,
+                }))?,
+            )
+            .await?;
+        }
+        ("POST", _) if path.starts_with("/webhook/") => {
+            let hook_path = path
+                .trim_start_matches("/webhook/")
+                .trim_matches('/')
+                .to_string();
+            if hook_path.is_empty() {
+                write_http_response(
+                    write_half,
+                    "404 Not Found",
+                    "application/json",
+                    "{\"ok\":false,\"error\":\"not_found\"}".to_string(),
+                )
+                .await?;
+                return Ok(());
             }
-            "subscribe" => {
-                write_half
-                    .write_all(
-                        json!({"ok": true, "subscribed": true})
-                            .to_string()
-                            .as_bytes(),
+
+            let Some(route) = service.store.get_webhook_route_by_path(&hook_path).await? else {
+                write_http_response(
+                    write_half,
+                    "404 Not Found",
+                    "application/json",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": false,
+                        "error": "route_not_found",
+                        "path": hook_path,
+                    }))?,
+                )
+                .await?;
+                return Ok(());
+            };
+
+            if let Some(expected) = route.token.as_deref().filter(|v| !v.trim().is_empty()) {
+                let provided = query
+                    .get("token")
+                    .map(String::as_str)
+                    .or_else(|| headers.get("x-maid-webhook-token").map(String::as_str))
+                    .unwrap_or("");
+                if provided != expected {
+                    write_http_response(
+                        write_half,
+                        "401 Unauthorized",
+                        "application/json",
+                        serde_json::to_string_pretty(&json!({
+                            "ok": false,
+                            "error": "invalid_token",
+                            "path": hook_path,
+                        }))?,
                     )
                     .await?;
-                write_half.write_all(b"\n").await?;
-                let mut rx = events.subscribe();
-                loop {
-                    match rx.recv().await {
-                        Ok(payload) => {
-                            write_half.write_all(payload.as_bytes()).await?;
-                            write_half.write_all(b"\n").await?;
-                        }
-                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            let warning = json!({"type":"gateway.warning","message":"lagged","skipped":skipped});
-                            write_half.write_all(warning.to_string().as_bytes()).await?;
-                            write_half.write_all(b"\n").await?;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    return Ok(());
+                }
+            }
+
+            let now = Utc::now();
+            service
+                .store
+                .mark_webhook_route_triggered(&route.id, now)
+                .await?;
+
+            let body_text = String::from_utf8_lossy(&body).to_string();
+            let group = service
+                .store
+                .get_group_by_id(&route.group_id)
+                .await?
+                .ok_or_else(|| anyhow!("group not found for webhook route {}", route.id))?;
+
+            let actor = format!("webhook:{}", route.path);
+            let mut triggered = Vec::new();
+            let mut failures = 0_u64;
+
+            if let Some(task_id) = route.task_id.clone() {
+                match service.run_task_now(&task_id, &actor).await {
+                    Ok(run) => triggered.push(json!({
+                        "type": "task",
+                        "task_id": task_id,
+                        "run_id": run.run_id,
+                        "status": run.status.as_str(),
+                    })),
+                    Err(err) => {
+                        failures += 1;
+                        triggered.push(json!({
+                            "type": "task",
+                            "task_id": task_id,
+                            "status": "FAILED",
+                            "error": format!("{err:#}"),
+                        }));
                     }
                 }
             }
-            _ => {
-                let payload = json!({ "ok": false, "error": "unknown command" });
-                write_half.write_all(payload.to_string().as_bytes()).await?;
-                write_half.write_all(b"\n").await?;
+            if let Some(template) = route.prompt_template.clone() {
+                let prompt = template
+                    .replace("{{body}}", &body_text)
+                    .replace("{{path}}", &route.path)
+                    .replace("{{group}}", &group.name)
+                    .replace("{{timestamp}}", &now.to_rfc3339());
+                match service.run_prompt(&group.name, &prompt, &actor).await {
+                    Ok(output) => triggered.push(json!({
+                        "type": "prompt",
+                        "group": group.name,
+                        "status": "SUCCEEDED",
+                        "output_preview": truncate_line(&output, 400),
+                    })),
+                    Err(err) => {
+                        failures += 1;
+                        triggered.push(json!({
+                            "type": "prompt",
+                            "group": group.name,
+                            "status": "FAILED",
+                            "error": format!("{err:#}"),
+                        }));
+                    }
+                }
             }
+
+            let result = if failures == 0 { "SUCCESS" } else { "FAILED" };
+            let _ = service
+                .store
+                .insert_audit(NewAudit {
+                    group_id: Some(group.id.clone()),
+                    action: "WEBHOOK_TRIGGER".to_string(),
+                    actor: actor.clone(),
+                    result: result.to_string(),
+                    created_at: now,
+                    metadata_json: Some(json!({
+                        "route_id": route.id,
+                        "path": route.path,
+                        "body_bytes": body.len(),
+                        "triggered": triggered,
+                    })),
+                })
+                .await;
+
+            events.publish(json!({
+                "type": "webhook.triggered",
+                "path": route.path,
+                "group": group.name,
+                "result": result,
+            }));
+
+            write_http_response(
+                write_half,
+                if failures == 0 {
+                    "200 OK"
+                } else {
+                    "500 Internal Server Error"
+                },
+                "application/json",
+                serde_json::to_string_pretty(&json!({
+                    "ok": failures == 0,
+                    "route": {
+                        "id": route.id,
+                        "name": route.name,
+                        "path": route.path,
+                    },
+                    "group": group.name,
+                    "triggered": triggered,
+                    "body_bytes": body.len(),
+                }))?,
+            )
+            .await?;
+        }
+        _ => {
+            write_http_response(
+                write_half,
+                "404 Not Found",
+                "application/json",
+                "{\"ok\":false,\"error\":\"not_found\"}".to_string(),
+            )
+            .await?;
         }
     }
+    Ok(())
 }
 
 fn parse_gateway_command(raw: &str) -> Result<String> {
@@ -2256,6 +2957,11 @@ pub(crate) fn run_guide() {
     println!(
         "  maid task create --group <name> --name <task> --schedule \"FREQ=...\" --prompt \"...\""
     );
+    println!(
+        "  maid task cron-add --group <name> --name <task> --every-minutes 15 --prompt \"...\""
+    );
+    println!("  maid task cron-list --group <name>");
+    println!("  maid task cron-remove --id <task_id>");
     println!("  maid task list --group <name>");
     println!("  maid task run-now --id <task_id>");
     println!("  maid daemon");
