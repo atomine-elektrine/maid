@@ -1,11 +1,14 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +359,284 @@ impl Default for CoreSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CoreTelemetrySnapshot {
+    pub prompt_runs_started_total: u64,
+    pub prompt_runs_succeeded_total: u64,
+    pub prompt_runs_failed_total: u64,
+    pub prompt_input_chars_total: u64,
+    pub prompt_output_chars_total: u64,
+    pub prompt_history_messages_total: u64,
+    pub prompt_elapsed_ms_total: u64,
+    pub task_executions_started_total: u64,
+    pub task_executions_manual_started_total: u64,
+    pub task_executions_scheduled_started_total: u64,
+    pub task_executions_succeeded_total: u64,
+    pub task_executions_failed_total: u64,
+    pub task_execution_elapsed_ms_total: u64,
+    pub task_execution_output_chars_total: u64,
+    pub model_tasks_started_total: u64,
+    pub model_tasks_succeeded_total: u64,
+    pub model_tasks_failed_total: u64,
+    pub model_task_prompt_chars_total: u64,
+    pub model_task_output_chars_total: u64,
+    pub model_task_history_messages_total: u64,
+    pub model_task_elapsed_ms_total: u64,
+    pub job_tasks_started_total: u64,
+    pub job_tasks_succeeded_total: u64,
+    pub job_tasks_failed_total: u64,
+    pub job_task_nonzero_exit_total: u64,
+    pub job_task_stdout_bytes_total: u64,
+    pub job_task_stderr_bytes_total: u64,
+    pub job_task_elapsed_ms_total: u64,
+}
+
+struct CoreTelemetry {
+    prompt_runs_started_total: AtomicU64,
+    prompt_runs_succeeded_total: AtomicU64,
+    prompt_runs_failed_total: AtomicU64,
+    prompt_input_chars_total: AtomicU64,
+    prompt_output_chars_total: AtomicU64,
+    prompt_history_messages_total: AtomicU64,
+    prompt_elapsed_ms_total: AtomicU64,
+    task_executions_started_total: AtomicU64,
+    task_executions_manual_started_total: AtomicU64,
+    task_executions_scheduled_started_total: AtomicU64,
+    task_executions_succeeded_total: AtomicU64,
+    task_executions_failed_total: AtomicU64,
+    task_execution_elapsed_ms_total: AtomicU64,
+    task_execution_output_chars_total: AtomicU64,
+    model_tasks_started_total: AtomicU64,
+    model_tasks_succeeded_total: AtomicU64,
+    model_tasks_failed_total: AtomicU64,
+    model_task_prompt_chars_total: AtomicU64,
+    model_task_output_chars_total: AtomicU64,
+    model_task_history_messages_total: AtomicU64,
+    model_task_elapsed_ms_total: AtomicU64,
+    job_tasks_started_total: AtomicU64,
+    job_tasks_succeeded_total: AtomicU64,
+    job_tasks_failed_total: AtomicU64,
+    job_task_nonzero_exit_total: AtomicU64,
+    job_task_stdout_bytes_total: AtomicU64,
+    job_task_stderr_bytes_total: AtomicU64,
+    job_task_elapsed_ms_total: AtomicU64,
+}
+
+impl CoreTelemetry {
+    const fn new() -> Self {
+        Self {
+            prompt_runs_started_total: AtomicU64::new(0),
+            prompt_runs_succeeded_total: AtomicU64::new(0),
+            prompt_runs_failed_total: AtomicU64::new(0),
+            prompt_input_chars_total: AtomicU64::new(0),
+            prompt_output_chars_total: AtomicU64::new(0),
+            prompt_history_messages_total: AtomicU64::new(0),
+            prompt_elapsed_ms_total: AtomicU64::new(0),
+            task_executions_started_total: AtomicU64::new(0),
+            task_executions_manual_started_total: AtomicU64::new(0),
+            task_executions_scheduled_started_total: AtomicU64::new(0),
+            task_executions_succeeded_total: AtomicU64::new(0),
+            task_executions_failed_total: AtomicU64::new(0),
+            task_execution_elapsed_ms_total: AtomicU64::new(0),
+            task_execution_output_chars_total: AtomicU64::new(0),
+            model_tasks_started_total: AtomicU64::new(0),
+            model_tasks_succeeded_total: AtomicU64::new(0),
+            model_tasks_failed_total: AtomicU64::new(0),
+            model_task_prompt_chars_total: AtomicU64::new(0),
+            model_task_output_chars_total: AtomicU64::new(0),
+            model_task_history_messages_total: AtomicU64::new(0),
+            model_task_elapsed_ms_total: AtomicU64::new(0),
+            job_tasks_started_total: AtomicU64::new(0),
+            job_tasks_succeeded_total: AtomicU64::new(0),
+            job_tasks_failed_total: AtomicU64::new(0),
+            job_task_nonzero_exit_total: AtomicU64::new(0),
+            job_task_stdout_bytes_total: AtomicU64::new(0),
+            job_task_stderr_bytes_total: AtomicU64::new(0),
+            job_task_elapsed_ms_total: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> CoreTelemetrySnapshot {
+        CoreTelemetrySnapshot {
+            prompt_runs_started_total: self.prompt_runs_started_total.load(Ordering::Relaxed),
+            prompt_runs_succeeded_total: self.prompt_runs_succeeded_total.load(Ordering::Relaxed),
+            prompt_runs_failed_total: self.prompt_runs_failed_total.load(Ordering::Relaxed),
+            prompt_input_chars_total: self.prompt_input_chars_total.load(Ordering::Relaxed),
+            prompt_output_chars_total: self.prompt_output_chars_total.load(Ordering::Relaxed),
+            prompt_history_messages_total: self
+                .prompt_history_messages_total
+                .load(Ordering::Relaxed),
+            prompt_elapsed_ms_total: self.prompt_elapsed_ms_total.load(Ordering::Relaxed),
+            task_executions_started_total: self
+                .task_executions_started_total
+                .load(Ordering::Relaxed),
+            task_executions_manual_started_total: self
+                .task_executions_manual_started_total
+                .load(Ordering::Relaxed),
+            task_executions_scheduled_started_total: self
+                .task_executions_scheduled_started_total
+                .load(Ordering::Relaxed),
+            task_executions_succeeded_total: self
+                .task_executions_succeeded_total
+                .load(Ordering::Relaxed),
+            task_executions_failed_total: self.task_executions_failed_total.load(Ordering::Relaxed),
+            task_execution_elapsed_ms_total: self
+                .task_execution_elapsed_ms_total
+                .load(Ordering::Relaxed),
+            task_execution_output_chars_total: self
+                .task_execution_output_chars_total
+                .load(Ordering::Relaxed),
+            model_tasks_started_total: self.model_tasks_started_total.load(Ordering::Relaxed),
+            model_tasks_succeeded_total: self.model_tasks_succeeded_total.load(Ordering::Relaxed),
+            model_tasks_failed_total: self.model_tasks_failed_total.load(Ordering::Relaxed),
+            model_task_prompt_chars_total: self
+                .model_task_prompt_chars_total
+                .load(Ordering::Relaxed),
+            model_task_output_chars_total: self
+                .model_task_output_chars_total
+                .load(Ordering::Relaxed),
+            model_task_history_messages_total: self
+                .model_task_history_messages_total
+                .load(Ordering::Relaxed),
+            model_task_elapsed_ms_total: self.model_task_elapsed_ms_total.load(Ordering::Relaxed),
+            job_tasks_started_total: self.job_tasks_started_total.load(Ordering::Relaxed),
+            job_tasks_succeeded_total: self.job_tasks_succeeded_total.load(Ordering::Relaxed),
+            job_tasks_failed_total: self.job_tasks_failed_total.load(Ordering::Relaxed),
+            job_task_nonzero_exit_total: self.job_task_nonzero_exit_total.load(Ordering::Relaxed),
+            job_task_stdout_bytes_total: self.job_task_stdout_bytes_total.load(Ordering::Relaxed),
+            job_task_stderr_bytes_total: self.job_task_stderr_bytes_total.load(Ordering::Relaxed),
+            job_task_elapsed_ms_total: self.job_task_elapsed_ms_total.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_prompt_start(&self, prompt_len: usize) {
+        self.prompt_runs_started_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.prompt_input_chars_total
+            .fetch_add(prompt_len as u64, Ordering::Relaxed);
+    }
+
+    fn record_prompt_success(&self, history_len: usize, output_len: usize, elapsed_ms: u64) {
+        self.prompt_runs_succeeded_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.prompt_history_messages_total
+            .fetch_add(history_len as u64, Ordering::Relaxed);
+        self.prompt_output_chars_total
+            .fetch_add(output_len as u64, Ordering::Relaxed);
+        self.prompt_elapsed_ms_total
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+    }
+
+    fn record_prompt_failure(&self, history_len: usize, elapsed_ms: u64) {
+        self.prompt_runs_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.prompt_history_messages_total
+            .fetch_add(history_len as u64, Ordering::Relaxed);
+        self.prompt_elapsed_ms_total
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+    }
+
+    fn record_task_execution_start(&self, trigger: &str) {
+        self.task_executions_started_total
+            .fetch_add(1, Ordering::Relaxed);
+        match trigger {
+            "MANUAL" => {
+                self.task_executions_manual_started_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "SCHEDULED" => {
+                self.task_executions_scheduled_started_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_task_execution_success(&self, summary_len: usize, elapsed_ms: u64) {
+        self.task_executions_succeeded_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.task_execution_output_chars_total
+            .fetch_add(summary_len as u64, Ordering::Relaxed);
+        self.task_execution_elapsed_ms_total
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+    }
+
+    fn record_task_execution_failure(&self, elapsed_ms: u64) {
+        self.task_executions_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.task_execution_elapsed_ms_total
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+    }
+
+    fn record_model_task_start(&self, prompt_len: usize) {
+        self.model_tasks_started_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.model_task_prompt_chars_total
+            .fetch_add(prompt_len as u64, Ordering::Relaxed);
+    }
+
+    fn record_model_task_success(&self, history_len: usize, output_len: usize, elapsed_ms: u64) {
+        self.model_tasks_succeeded_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.model_task_history_messages_total
+            .fetch_add(history_len as u64, Ordering::Relaxed);
+        self.model_task_output_chars_total
+            .fetch_add(output_len as u64, Ordering::Relaxed);
+        self.model_task_elapsed_ms_total
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+    }
+
+    fn record_model_task_failure(&self, history_len: usize, elapsed_ms: u64) {
+        self.model_tasks_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.model_task_history_messages_total
+            .fetch_add(history_len as u64, Ordering::Relaxed);
+        self.model_task_elapsed_ms_total
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+    }
+
+    fn record_job_task_start(&self) {
+        self.job_tasks_started_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_job_task_success(&self, stdout_bytes: usize, stderr_bytes: usize, elapsed_ms: u64) {
+        self.job_tasks_succeeded_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.job_task_stdout_bytes_total
+            .fetch_add(stdout_bytes as u64, Ordering::Relaxed);
+        self.job_task_stderr_bytes_total
+            .fetch_add(stderr_bytes as u64, Ordering::Relaxed);
+        self.job_task_elapsed_ms_total
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+    }
+
+    fn record_job_task_failure(
+        &self,
+        nonzero_exit: bool,
+        stdout_bytes: usize,
+        stderr_bytes: usize,
+        elapsed_ms: u64,
+    ) {
+        self.job_tasks_failed_total.fetch_add(1, Ordering::Relaxed);
+        self.job_task_stdout_bytes_total
+            .fetch_add(stdout_bytes as u64, Ordering::Relaxed);
+        self.job_task_stderr_bytes_total
+            .fetch_add(stderr_bytes as u64, Ordering::Relaxed);
+        self.job_task_elapsed_ms_total
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+        if nonzero_exit {
+            self.job_task_nonzero_exit_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+static CORE_TELEMETRY: CoreTelemetry = CoreTelemetry::new();
+
+pub fn telemetry_snapshot() -> CoreTelemetrySnapshot {
+    CORE_TELEMETRY.snapshot()
+}
+
 pub struct MaidService<S, M, R>
 where
     S: Storage,
@@ -425,6 +706,14 @@ where
 
     pub async fn run_prompt(&self, group_name: &str, prompt: &str, actor: &str) -> Result<String> {
         validate_prompt(prompt)?;
+        let started = Instant::now();
+        debug!(
+            group_name,
+            actor,
+            prompt_len = prompt.len(),
+            "prompt run started"
+        );
+        CORE_TELEMETRY.record_prompt_start(prompt.len());
 
         let group = self
             .store
@@ -446,15 +735,34 @@ where
                 content: m.content,
             })
             .collect::<Vec<_>>();
+        let history_len = history.len();
 
-        let response = self
+        let response = match self
             .model
             .run(ModelRunRequest {
                 group_name: group.name.clone(),
                 prompt: prompt.to_string(),
                 history,
             })
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                CORE_TELEMETRY
+                    .record_prompt_failure(history_len, started.elapsed().as_millis() as u64);
+                warn!(
+                    group_name,
+                    actor,
+                    prompt_len = prompt.len(),
+                    history_len,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    error = %err,
+                    "prompt run failed"
+                );
+                return Err(err);
+            }
+        };
+        let output_len = response.output_text.len();
 
         self.store
             .insert_message(&group.id, MessageRole::Assistant, &response.output_text)
@@ -472,6 +780,20 @@ where
             })
             .await;
 
+        CORE_TELEMETRY.record_prompt_success(
+            history_len,
+            output_len,
+            started.elapsed().as_millis() as u64,
+        );
+        info!(
+            group_name,
+            actor,
+            prompt_len = prompt.len(),
+            history_len,
+            output_len,
+            elapsed_ms = started.elapsed().as_millis(),
+            "prompt run completed"
+        );
         Ok(response.output_text)
     }
 
@@ -802,6 +1124,7 @@ where
         &self,
         request: TaskExecutionRequest,
     ) -> Result<TaskExecutionResult> {
+        let started = Instant::now();
         let task = self
             .store
             .get_task(&request.task_id)
@@ -813,6 +1136,18 @@ where
             .get_group_by_id(&task.group_id)
             .await?
             .ok_or_else(|| anyhow!("group not found for task: {}", task.group_id))?;
+
+        let actor = request.actor.clone();
+        let trigger = request.trigger.as_str().to_string();
+        debug!(
+            task_id = %task.id,
+            task_name = %task.name,
+            group_name = %group.name,
+            actor,
+            trigger,
+            scheduled_for = ?request.scheduled_for,
+            "task execution started"
+        );
 
         let run = self
             .store
@@ -831,13 +1166,16 @@ where
                     group.name
                 ));
             }
+            CORE_TELEMETRY.record_task_execution_start(&trigger);
             self.execute_job_task(&task, &group).await
         } else {
+            CORE_TELEMETRY.record_task_execution_start(&trigger);
             self.execute_model_task(&task, &group).await
         };
 
         match outcome {
             Ok(summary) => {
+                let summary_len = summary.len();
                 self.store
                     .finish_task_run(
                         &run.id,
@@ -852,16 +1190,30 @@ where
                     .insert_audit(NewAudit {
                         group_id: Some(group.id),
                         action: "TASK_EXECUTE".to_string(),
-                        actor: request.actor,
+                        actor: actor.clone(),
                         result: "SUCCESS".to_string(),
                         created_at: Utc::now(),
                         metadata_json: Some(json!({
                             "task_id": task.id,
-                            "trigger": request.trigger.as_str(),
+                            "trigger": trigger.clone(),
                             "run_id": run.id,
                         })),
                     })
                     .await;
+                CORE_TELEMETRY.record_task_execution_success(
+                    summary_len,
+                    started.elapsed().as_millis() as u64,
+                );
+                info!(
+                    task_id = %task.id,
+                    run_id = %run.id,
+                    task_name = %task.name,
+                    group_name = %group.name,
+                    trigger,
+                    summary_len,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "task execution succeeded"
+                );
                 Ok(TaskExecutionResult {
                     run_id: run.id,
                     status: TaskRunStatus::Succeeded,
@@ -885,17 +1237,28 @@ where
                     .insert_audit(NewAudit {
                         group_id: Some(group.id),
                         action: "TASK_EXECUTE".to_string(),
-                        actor: request.actor,
+                        actor: actor.clone(),
                         result: "FAILED".to_string(),
                         created_at: Utc::now(),
                         metadata_json: Some(json!({
                             "task_id": task.id,
-                            "trigger": request.trigger.as_str(),
+                            "trigger": trigger.clone(),
                             "run_id": run.id,
                             "error": err_text,
                         })),
                     })
                     .await;
+                CORE_TELEMETRY.record_task_execution_failure(started.elapsed().as_millis() as u64);
+                warn!(
+                    task_id = %task.id,
+                    run_id = %run.id,
+                    task_name = %task.name,
+                    group_name = %group.name,
+                    trigger,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    error = %err_text,
+                    "task execution failed"
+                );
                 Ok(TaskExecutionResult {
                     run_id: run.id,
                     status: TaskRunStatus::Failed,
@@ -907,6 +1270,16 @@ where
     }
 
     async fn execute_model_task(&self, task: &Task, group: &Group) -> Result<String> {
+        let started = Instant::now();
+        debug!(
+            task_id = %task.id,
+            task_name = %task.name,
+            group_name = %group.name,
+            prompt_len = task.prompt_template.len(),
+            "model task started"
+        );
+        CORE_TELEMETRY.record_model_task_start(task.prompt_template.len());
+
         self.store
             .insert_message(&group.id, MessageRole::User, &task.prompt_template)
             .await?;
@@ -921,24 +1294,60 @@ where
                 content: m.content,
             })
             .collect::<Vec<_>>();
+        let history_len = history.len();
 
-        let response = self
+        let response = match self
             .model
             .run(ModelRunRequest {
                 group_name: group.name.clone(),
                 prompt: task.prompt_template.clone(),
                 history,
             })
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                CORE_TELEMETRY
+                    .record_model_task_failure(history_len, started.elapsed().as_millis() as u64);
+                warn!(
+                    task_id = %task.id,
+                    task_name = %task.name,
+                    group_name = %group.name,
+                    prompt_len = task.prompt_template.len(),
+                    history_len,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    error = %err,
+                    "model task failed"
+                );
+                return Err(err);
+            }
+        };
+        let output_len = response.output_text.len();
 
         self.store
             .insert_message(&group.id, MessageRole::Assistant, &response.output_text)
             .await?;
 
+        CORE_TELEMETRY.record_model_task_success(
+            history_len,
+            output_len,
+            started.elapsed().as_millis() as u64,
+        );
+        info!(
+            task_id = %task.id,
+            task_name = %task.name,
+            group_name = %group.name,
+            prompt_len = task.prompt_template.len(),
+            history_len,
+            output_len,
+            elapsed_ms = started.elapsed().as_millis(),
+            "model task completed"
+        );
         Ok(response.output_text)
     }
 
     async fn execute_job_task(&self, task: &Task, group: &Group) -> Result<String> {
+        let started = Instant::now();
         let raw = task
             .prompt_template
             .trim_start()
@@ -950,6 +1359,17 @@ where
         if cmd.is_empty() {
             return Err(anyhow!("job command is empty"));
         }
+        let command_name = cmd[0].clone();
+        let argv_len = cmd.len();
+        debug!(
+            task_id = %task.id,
+            task_name = %task.name,
+            group_name = %group.name,
+            command_name,
+            argv_len,
+            "job task started"
+        );
+        CORE_TELEMETRY.record_job_task_start();
 
         let group_root = PathBuf::from(&group.root_path);
         if !is_safe_group_root(&self.settings.group_root, &group_root)? {
@@ -966,7 +1386,28 @@ where
                 .min(self.settings.max_job_timeout_secs),
         };
 
-        let result = self.sandbox.run_job(spec).await?;
+        let result = match self.sandbox.run_job(spec).await {
+            Ok(result) => result,
+            Err(err) => {
+                CORE_TELEMETRY.record_job_task_failure(
+                    false,
+                    0,
+                    0,
+                    started.elapsed().as_millis() as u64,
+                );
+                warn!(
+                    task_id = %task.id,
+                    task_name = %task.name,
+                    group_name = %group.name,
+                    command_name,
+                    argv_len,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    error = %err,
+                    "job task sandbox execution failed"
+                );
+                return Err(err);
+            }
+        };
 
         let summary = format!(
             "exit={}\nstdout:\n{}\nstderr:\n{}",
@@ -974,12 +1415,45 @@ where
         );
 
         if result.exit_code != 0 {
+            CORE_TELEMETRY.record_job_task_failure(
+                true,
+                result.stdout.len(),
+                result.stderr.len(),
+                started.elapsed().as_millis() as u64,
+            );
+            warn!(
+                task_id = %task.id,
+                task_name = %task.name,
+                group_name = %group.name,
+                command_name,
+                argv_len,
+                exit_code = result.exit_code,
+                elapsed_ms = started.elapsed().as_millis(),
+                "job task failed with non-zero exit"
+            );
             return Err(anyhow!(
                 "sandbox job failed with exit code {}",
                 result.exit_code
             ));
         }
 
+        CORE_TELEMETRY.record_job_task_success(
+            result.stdout.len(),
+            result.stderr.len(),
+            started.elapsed().as_millis() as u64,
+        );
+        info!(
+            task_id = %task.id,
+            task_name = %task.name,
+            group_name = %group.name,
+            command_name,
+            argv_len,
+            exit_code = result.exit_code,
+            stdout_bytes = result.stdout.len(),
+            stderr_bytes = result.stderr.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "job task completed"
+        );
         Ok(summary)
     }
 }

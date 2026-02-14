@@ -15,10 +15,7 @@ provider = "openai"
 
 [plugins]
 directory = "plugins"
-enabled = [
-    "code-analysis",
-    "siem-convert",
-]
+enabled = []
 validate_on_startup = true
 
 [policy]

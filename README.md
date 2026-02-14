@@ -66,6 +66,9 @@ cargo run -p maid -- gateway --port 18789
 
 # scheduler + gateway + telegram
 cargo run -p maid -- serve
+
+# prometheus metrics (gateway)
+curl -s http://127.0.0.1:18789/metrics
 ```
 
 ## Plugin HTTP API (generic)

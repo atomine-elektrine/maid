@@ -1226,6 +1226,237 @@ pub(crate) fn parse_http_target(target: &str) -> Result<(String, BTreeMap<String
     Ok((url.path().to_string(), query))
 }
 
+fn prometheus_escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn render_prometheus_metrics(gateway_status: Option<&GatewayStatus>) -> String {
+    let metrics = maid_core::telemetry_snapshot();
+    let mut body = String::new();
+
+    if let Some(status) = gateway_status {
+        body.push_str("# HELP maid_gateway_info Gateway runtime information.\n");
+        body.push_str("# TYPE maid_gateway_info gauge\n");
+        body.push_str(&format!(
+            "maid_gateway_info{{model_provider=\"{}\",runtime=\"{}\",telegram_enabled=\"{}\"}} 1\n",
+            prometheus_escape_label(&status.model_provider),
+            prometheus_escape_label(&status.runtime),
+            if status.telegram_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        ));
+        body.push_str(
+            "# HELP maid_gateway_scheduler_tick_seconds Configured scheduler tick interval.\n",
+        );
+        body.push_str("# TYPE maid_gateway_scheduler_tick_seconds gauge\n");
+        body.push_str(&format!(
+            "maid_gateway_scheduler_tick_seconds {}\n",
+            status.scheduler_tick_seconds
+        ));
+        body.push_str(
+            "# HELP maid_gateway_scheduler_max_concurrency Configured scheduler max concurrency.\n",
+        );
+        body.push_str("# TYPE maid_gateway_scheduler_max_concurrency gauge\n");
+        body.push_str(&format!(
+            "maid_gateway_scheduler_max_concurrency {}\n",
+            status.scheduler_max_concurrency
+        ));
+        body.push_str("# HELP maid_gateway_uptime_seconds Seconds since gateway startup.\n");
+        body.push_str("# TYPE maid_gateway_uptime_seconds gauge\n");
+        let uptime_seconds = chrono::DateTime::parse_from_rfc3339(&status.started_at)
+            .map(|started_at| {
+                (Utc::now() - started_at.with_timezone(&Utc))
+                    .num_seconds()
+                    .max(0) as u64
+            })
+            .unwrap_or(0);
+        body.push_str(&format!("maid_gateway_uptime_seconds {}\n", uptime_seconds));
+    }
+
+    body.push_str("# HELP maid_core_prompt_runs_total Total prompt runs tracked in maid-core.\n");
+    body.push_str("# TYPE maid_core_prompt_runs_total counter\n");
+    body.push_str(&format!(
+        "maid_core_prompt_runs_total{{outcome=\"started\"}} {}\n",
+        metrics.prompt_runs_started_total
+    ));
+    body.push_str(&format!(
+        "maid_core_prompt_runs_total{{outcome=\"succeeded\"}} {}\n",
+        metrics.prompt_runs_succeeded_total
+    ));
+    body.push_str(&format!(
+        "maid_core_prompt_runs_total{{outcome=\"failed\"}} {}\n",
+        metrics.prompt_runs_failed_total
+    ));
+    body.push_str("# HELP maid_core_prompt_input_chars_total Total prompt input characters.\n");
+    body.push_str("# TYPE maid_core_prompt_input_chars_total counter\n");
+    body.push_str(&format!(
+        "maid_core_prompt_input_chars_total {}\n",
+        metrics.prompt_input_chars_total
+    ));
+    body.push_str("# HELP maid_core_prompt_output_chars_total Total prompt output characters.\n");
+    body.push_str("# TYPE maid_core_prompt_output_chars_total counter\n");
+    body.push_str(&format!(
+        "maid_core_prompt_output_chars_total {}\n",
+        metrics.prompt_output_chars_total
+    ));
+    body.push_str(
+        "# HELP maid_core_prompt_history_messages_total Total history messages sent with prompts.\n",
+    );
+    body.push_str("# TYPE maid_core_prompt_history_messages_total counter\n");
+    body.push_str(&format!(
+        "maid_core_prompt_history_messages_total {}\n",
+        metrics.prompt_history_messages_total
+    ));
+    body.push_str(
+        "# HELP maid_core_prompt_elapsed_ms_total Total prompt run duration in milliseconds.\n",
+    );
+    body.push_str("# TYPE maid_core_prompt_elapsed_ms_total counter\n");
+    body.push_str(&format!(
+        "maid_core_prompt_elapsed_ms_total {}\n",
+        metrics.prompt_elapsed_ms_total
+    ));
+
+    body.push_str(
+        "# HELP maid_core_task_executions_total Total task executions tracked in maid-core.\n",
+    );
+    body.push_str("# TYPE maid_core_task_executions_total counter\n");
+    body.push_str(&format!(
+        "maid_core_task_executions_total{{outcome=\"started\"}} {}\n",
+        metrics.task_executions_started_total
+    ));
+    body.push_str(&format!(
+        "maid_core_task_executions_total{{outcome=\"succeeded\"}} {}\n",
+        metrics.task_executions_succeeded_total
+    ));
+    body.push_str(&format!(
+        "maid_core_task_executions_total{{outcome=\"failed\"}} {}\n",
+        metrics.task_executions_failed_total
+    ));
+    body.push_str(
+        "# HELP maid_core_task_executions_started_total Total started task executions by trigger.\n",
+    );
+    body.push_str("# TYPE maid_core_task_executions_started_total counter\n");
+    body.push_str(&format!(
+        "maid_core_task_executions_started_total{{trigger=\"manual\"}} {}\n",
+        metrics.task_executions_manual_started_total
+    ));
+    body.push_str(&format!(
+        "maid_core_task_executions_started_total{{trigger=\"scheduled\"}} {}\n",
+        metrics.task_executions_scheduled_started_total
+    ));
+    body.push_str("# HELP maid_core_task_execution_output_chars_total Total task output summary characters.\n");
+    body.push_str("# TYPE maid_core_task_execution_output_chars_total counter\n");
+    body.push_str(&format!(
+        "maid_core_task_execution_output_chars_total {}\n",
+        metrics.task_execution_output_chars_total
+    ));
+    body.push_str(
+        "# HELP maid_core_task_execution_elapsed_ms_total Total task execution duration in milliseconds.\n",
+    );
+    body.push_str("# TYPE maid_core_task_execution_elapsed_ms_total counter\n");
+    body.push_str(&format!(
+        "maid_core_task_execution_elapsed_ms_total {}\n",
+        metrics.task_execution_elapsed_ms_total
+    ));
+
+    body.push_str("# HELP maid_core_model_tasks_total Total model-backed task runs.\n");
+    body.push_str("# TYPE maid_core_model_tasks_total counter\n");
+    body.push_str(&format!(
+        "maid_core_model_tasks_total{{outcome=\"started\"}} {}\n",
+        metrics.model_tasks_started_total
+    ));
+    body.push_str(&format!(
+        "maid_core_model_tasks_total{{outcome=\"succeeded\"}} {}\n",
+        metrics.model_tasks_succeeded_total
+    ));
+    body.push_str(&format!(
+        "maid_core_model_tasks_total{{outcome=\"failed\"}} {}\n",
+        metrics.model_tasks_failed_total
+    ));
+    body.push_str(
+        "# HELP maid_core_model_task_prompt_chars_total Total characters in model task prompts.\n",
+    );
+    body.push_str("# TYPE maid_core_model_task_prompt_chars_total counter\n");
+    body.push_str(&format!(
+        "maid_core_model_task_prompt_chars_total {}\n",
+        metrics.model_task_prompt_chars_total
+    ));
+    body.push_str("# HELP maid_core_model_task_output_chars_total Total characters generated by model tasks.\n");
+    body.push_str("# TYPE maid_core_model_task_output_chars_total counter\n");
+    body.push_str(&format!(
+        "maid_core_model_task_output_chars_total {}\n",
+        metrics.model_task_output_chars_total
+    ));
+    body.push_str("# HELP maid_core_model_task_history_messages_total Total history messages used by model tasks.\n");
+    body.push_str("# TYPE maid_core_model_task_history_messages_total counter\n");
+    body.push_str(&format!(
+        "maid_core_model_task_history_messages_total {}\n",
+        metrics.model_task_history_messages_total
+    ));
+    body.push_str(
+        "# HELP maid_core_model_task_elapsed_ms_total Total model task duration in milliseconds.\n",
+    );
+    body.push_str("# TYPE maid_core_model_task_elapsed_ms_total counter\n");
+    body.push_str(&format!(
+        "maid_core_model_task_elapsed_ms_total {}\n",
+        metrics.model_task_elapsed_ms_total
+    ));
+
+    body.push_str("# HELP maid_core_job_tasks_total Total job-backed task runs.\n");
+    body.push_str("# TYPE maid_core_job_tasks_total counter\n");
+    body.push_str(&format!(
+        "maid_core_job_tasks_total{{outcome=\"started\"}} {}\n",
+        metrics.job_tasks_started_total
+    ));
+    body.push_str(&format!(
+        "maid_core_job_tasks_total{{outcome=\"succeeded\"}} {}\n",
+        metrics.job_tasks_succeeded_total
+    ));
+    body.push_str(&format!(
+        "maid_core_job_tasks_total{{outcome=\"failed\"}} {}\n",
+        metrics.job_tasks_failed_total
+    ));
+    body.push_str(
+        "# HELP maid_core_job_task_nonzero_exit_total Total job task runs that exited non-zero.\n",
+    );
+    body.push_str("# TYPE maid_core_job_task_nonzero_exit_total counter\n");
+    body.push_str(&format!(
+        "maid_core_job_task_nonzero_exit_total {}\n",
+        metrics.job_task_nonzero_exit_total
+    ));
+    body.push_str(
+        "# HELP maid_core_job_task_stdout_bytes_total Total stdout bytes produced by job tasks.\n",
+    );
+    body.push_str("# TYPE maid_core_job_task_stdout_bytes_total counter\n");
+    body.push_str(&format!(
+        "maid_core_job_task_stdout_bytes_total {}\n",
+        metrics.job_task_stdout_bytes_total
+    ));
+    body.push_str(
+        "# HELP maid_core_job_task_stderr_bytes_total Total stderr bytes produced by job tasks.\n",
+    );
+    body.push_str("# TYPE maid_core_job_task_stderr_bytes_total counter\n");
+    body.push_str(&format!(
+        "maid_core_job_task_stderr_bytes_total {}\n",
+        metrics.job_task_stderr_bytes_total
+    ));
+    body.push_str(
+        "# HELP maid_core_job_task_elapsed_ms_total Total job task duration in milliseconds.\n",
+    );
+    body.push_str("# TYPE maid_core_job_task_elapsed_ms_total counter\n");
+    body.push_str(&format!(
+        "maid_core_job_task_elapsed_ms_total {}\n",
+        metrics.job_task_elapsed_ms_total
+    ));
+
+    body
+}
+
 async fn write_http_response(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     status: &str,
@@ -2748,6 +2979,16 @@ async fn handle_gateway_http_request(
 
     let (path, query) = parse_http_target(target)?;
     match (method, path.as_str()) {
+        ("GET", "/metrics") => {
+            let body = render_prometheus_metrics(Some(status));
+            write_http_response(
+                write_half,
+                "200 OK",
+                "text/plain; version=0.0.4; charset=utf-8",
+                body,
+            )
+            .await?;
+        }
         ("GET", "/health") => {
             write_http_response(
                 write_half,
@@ -2971,6 +3212,7 @@ pub(crate) fn run_guide() {
     println!("  maid onboard --interactive");
     println!("  maid doctor");
     println!("  maid dashboard --port 18790");
+    println!("  curl -s http://127.0.0.1:18789/metrics");
     println!();
     println!("Extensions:");
     println!("  maid plugin list");
@@ -3312,7 +3554,7 @@ enabled = ["memory.recent", "tasks.snapshot", "group.profile"]
 
 [plugins]
 directory = "plugins"
-enabled = ["echo"]
+enabled = []
 # allow_unlisted = false
 # tool_allowlist = ["group.list", "group.create", "run.prompt", "task.list", "task.create", "task.run_now", "task.pause", "task.resume", "task.delete", "task.clear_group", "task.clear_all", "ops.web_fetch", "ops.search", "ops.grep"]
 # tool_max_calls_per_minute = 60
@@ -3329,8 +3571,8 @@ validate_on_startup = true
 # quarantine_untrusted = false
 # [plugins.routing]
 # enabled = false
-# intent_rules = [{ pattern = "(?i)convert.*spl.*kql", plugin = "siem-convert", command = "convert" }]
-# pinned = [{ capability = "siem.query.convert.ai", plugin = "siem-convert" }]
+# intent_rules = [{ pattern = "(?i)convert.*spl.*kql", plugin = "iskra", command = "convert" }]
+# pinned = [{ capability = "siem.query.convert.ai", plugin = "iskra" }]
 
 [tools]
 # web_fetch_timeout_seconds = 15
@@ -3382,13 +3624,13 @@ enabled = ["memory.recent", "tasks.snapshot", "group.profile"]
 
 [plugins]
 directory = "plugins"
-enabled = ["echo"]
+enabled = []
 validate_on_startup = true
 # [plugins.trust]
 # trusted_publishers = ["maid-official"]
 # [plugins.routing]
 # enabled = true
-# intent_rules = [{ pattern = "(?i)convert.*spl.*kql", plugin = "siem-convert", command = "convert" }]
+# intent_rules = [{ pattern = "(?i)convert.*spl.*kql", plugin = "iskra", command = "convert" }]
 
 [tools]
 auto_router_enabled = true
@@ -3434,7 +3676,7 @@ max_invocations = 5
 
 [plugins]
 directory = "plugins"
-enabled = ["echo", "code-analysis"]
+enabled = []
 validate_on_startup = true
 [plugins.signing]
 require_signatures = true

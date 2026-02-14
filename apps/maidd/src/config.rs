@@ -1232,8 +1232,8 @@ mod tests {
 
         [plugins.routing]
         enabled = true
-        intent_rules = [{ pattern = "(?i)convert.*spl.*kql", plugin = "siem-convert", command = "convert" }]
-        pinned = [{ capability = "siem.query.convert.ai", plugin = "siem-convert" }]
+        intent_rules = [{ pattern = "(?i)convert.*spl.*kql", plugin = "iskra", command = "convert" }]
+        pinned = [{ capability = "siem.query.convert.ai", plugin = "iskra" }]
 
         [tools]
         web_fetch_timeout_seconds = 20

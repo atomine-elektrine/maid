@@ -1009,6 +1009,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shell-words",
+ "tracing",
  "uuid",
 ]
 

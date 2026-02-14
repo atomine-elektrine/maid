@@ -9,3 +9,9 @@ name = "code-analysis"
 version = "0.1.0"
 description = "AI-powered whitebox static code analysis for any codebase"
 source = "../plugin-repos-local/code-analysis"
+
+[[plugin]]
+name = "iskra"
+version = "0.1.0"
+description = "AI-first converter across common SIEM query dialects"
+source = "iskra"
