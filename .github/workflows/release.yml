@@ -1,0 +1,175 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to release (example: v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify (locked tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --locked
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: linux-x86_64
+            bin_name: maid
+          - os: macos-13
+            target: x86_64-apple-darwin
+            label: macos-x86_64
+            bin_name: maid
+          - os: macos-14
+            target: aarch64-apple-darwin
+            label: macos-aarch64
+            bin_name: maid
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            label: windows-x86_64
+            bin_name: maid.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve release version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ inputs.release_tag }}"
+          fi
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must match v<major>.<minor>.<patch>; got: $TAG" >&2
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+          BASE="maid-v${VERSION}-${{ matrix.label }}"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        run: cargo build -p maid --release --locked --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          BASE="${{ steps.meta.outputs.base }}"
+          BIN="target/${{ matrix.target }}/release/${{ matrix.bin_name }}"
+
+          cp "$BIN" "dist/$BASE"
+          tar -C dist -czf "dist/${BASE}.tar.gz" "$BASE"
+          rm -f "dist/$BASE"
+          shasum -a 256 "dist/${BASE}.tar.gz" > "dist/${BASE}.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $base = "${{ steps.meta.outputs.base }}"
+          $bin = "target/${{ matrix.target }}/release/${{ matrix.bin_name }}"
+          Copy-Item $bin "dist/$base.exe"
+          Compress-Archive -Path "dist/$base.exe" -DestinationPath "dist/$base.zip" -Force
+          Remove-Item "dist/$base.exe" -Force
+          $hash = (Get-FileHash "dist/$base.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $base.zip" | Out-File -FilePath "dist/$base.zip.sha256" -Encoding ascii
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve release tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ inputs.release_tag }}"
+          fi
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must match v<major>.<minor>.<patch>; got: $TAG" >&2
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Build combined checksums file
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat release-assets/*.sha256 > release-assets/SHA256SUMS.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            release-assets/*
