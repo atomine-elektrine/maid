@@ -7,12 +7,32 @@
 - plugins and skills
 - CLI + dashboard + gateway + Telegram surfaces
 
+## How to run commands
+
+All examples below use `maid` directly:
+
+```bash
+maid <command>
+```
+
+If you are running from source and do not have `maid` installed, use:
+
+```bash
+cargo run -p maid -- <command>
+```
+
+Optional shell helper while developing from source:
+
+```bash
+alias maid='cargo run -p maid --'
+```
+
 ## 5-minute setup
 
 1. Create config:
 
 ```bash
-cargo run -p maid -- init --template personal
+maid init --template personal
 ```
 
 2. Add API key to `.env`:
@@ -24,48 +44,48 @@ OPENAI_API_KEY=your_key_here
 3. Validate environment:
 
 ```bash
-cargo run -p maid -- doctor
+maid doctor
 ```
 
 4. Create a group and run a prompt:
 
 ```bash
-cargo run -p maid -- group create work
-cargo run -p maid -- run --group work --prompt "Plan my day in 5 bullets"
+maid group create work
+maid run --group work --prompt "Plan my day in 5 bullets"
 ```
 
 ## Common commands
 
 ```bash
 # status
-cargo run -p maid -- status
+maid status
 
 # groups
-cargo run -p maid -- group list
+maid group list
 
 # tasks
-cargo run -p maid -- task list --group work
-cargo run -p maid -- task run-now --id <task_id>
+maid task list --group work
+maid task run-now --id <task_id>
 
 # plugins
-cargo run -p maid -- plugin list
-cargo run -p maid -- plugin run --name <plugin> --command help
+maid plugin list
+maid plugin run --name <plugin> --command help
 ```
 
 ## Run services
 
 ```bash
 # scheduler only
-cargo run -p maid -- daemon
+maid daemon
 
 # dashboard (HTTP)
-cargo run -p maid -- dashboard --port 18790
+maid dashboard --port 18790
 
 # gateway
-cargo run -p maid -- gateway --port 18789
+maid gateway --port 18789
 
 # scheduler + gateway + telegram
-cargo run -p maid -- serve
+maid serve
 
 # prometheus metrics (gateway)
 curl -s http://127.0.0.1:18789/metrics
