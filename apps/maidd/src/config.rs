@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub skills: Option<SkillsConfig>,
     pub plugins: Option<PluginsConfig>,
     pub tools: Option<ToolsConfig>,
+    pub mcp: Option<McpConfig>,
     pub policy: Option<PolicyConfig>,
     pub security: Option<SecurityConfig>,
 }
@@ -152,6 +153,24 @@ pub struct ToolsConfig {
     pub search_max_results: Option<u64>,
     pub auto_router_enabled: Option<bool>,
     pub auto_router_allowlist: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpConfig {
+    pub enabled: Option<bool>,
+    pub request_timeout_seconds: Option<u64>,
+    pub servers: Option<BTreeMap<String, McpServerConfig>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerConfig {
+    pub transport: Option<String>,
+    pub command: String,
+    pub args: Option<Vec<String>>,
+    pub cwd: Option<String>,
+    pub enabled: Option<bool>,
+    pub env_allowlist: Option<Vec<String>>,
+    pub startup_timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -558,6 +577,73 @@ impl AppConfig {
                         return Err(anyhow!(
                             "tools.auto_router_allowlist contains duplicate tool name: {tool}"
                         ));
+                    }
+                }
+            }
+        }
+        if let Some(mcp) = &self.mcp {
+            if let Some(timeout) = mcp.request_timeout_seconds {
+                if timeout == 0 || timeout > 300 {
+                    return Err(anyhow!(
+                        "mcp.request_timeout_seconds must be between 1 and 300"
+                    ));
+                }
+            }
+
+            if mcp.enabled.unwrap_or(false)
+                && mcp
+                    .servers
+                    .as_ref()
+                    .map(|servers| servers.is_empty())
+                    .unwrap_or(true)
+            {
+                return Err(anyhow!("mcp.enabled=true requires mcp.servers"));
+            }
+
+            if let Some(servers) = &mcp.servers {
+                for (name, server) in servers {
+                    validate_mcp_server_name(name)?;
+                    if server.command.trim().is_empty() {
+                        return Err(anyhow!("mcp.servers.{name}.command must not be empty"));
+                    }
+                    if let Some(transport) = &server.transport {
+                        if transport != "stdio" {
+                            return Err(anyhow!("mcp.servers.{name}.transport must be stdio"));
+                        }
+                    }
+                    if let Some(args) = &server.args {
+                        for arg in args {
+                            if arg.trim().is_empty() {
+                                return Err(anyhow!(
+                                    "mcp.servers.{name}.args values must not be empty"
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(cwd) = &server.cwd {
+                        if cwd.trim().is_empty() {
+                            return Err(anyhow!(
+                                "mcp.servers.{name}.cwd must not be empty when set"
+                            ));
+                        }
+                    }
+                    if let Some(env_allowlist) = &server.env_allowlist {
+                        let mut seen = std::collections::HashSet::new();
+                        for env_name in env_allowlist {
+                            validate_env_var_name(env_name)?;
+                            if !seen.insert(env_name) {
+                                return Err(anyhow!(
+                                    "mcp.servers.{name}.env_allowlist contains duplicate value: {env_name}"
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(startup_timeout) = server.startup_timeout_seconds {
+                        if startup_timeout == 0 || startup_timeout > 120 {
+                            return Err(anyhow!(
+                                "mcp.servers.{name}.startup_timeout_seconds must be between 1 and 120"
+                            ));
+                        }
                     }
                 }
             }
@@ -994,6 +1080,53 @@ impl AppConfig {
             .unwrap_or_else(|| vec!["ops.web_fetch".to_string(), "ops.search".to_string()])
     }
 
+    pub fn mcp_enabled(&self) -> bool {
+        self.mcp
+            .as_ref()
+            .and_then(|mcp| mcp.enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn mcp_request_timeout_seconds(&self) -> u64 {
+        self.mcp
+            .as_ref()
+            .and_then(|mcp| mcp.request_timeout_seconds)
+            .unwrap_or(20)
+    }
+
+    pub fn mcp_server_config(&self, name: &str) -> Option<McpServerConfig> {
+        if !self.mcp_enabled() {
+            return None;
+        }
+        let server = self
+            .mcp
+            .as_ref()
+            .and_then(|mcp| mcp.servers.as_ref())
+            .and_then(|servers| servers.get(name))
+            .cloned()?;
+        if !server.enabled.unwrap_or(true) {
+            return None;
+        }
+        Some(server)
+    }
+
+    pub fn enabled_mcp_servers(&self) -> Vec<String> {
+        if !self.mcp_enabled() {
+            return Vec::new();
+        }
+        self.mcp
+            .as_ref()
+            .and_then(|mcp| mcp.servers.as_ref())
+            .map(|servers| {
+                servers
+                    .iter()
+                    .filter(|(_, server)| server.enabled.unwrap_or(true))
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn is_production(&self) -> bool {
         self.security
             .as_ref()
@@ -1125,6 +1258,36 @@ fn validate_tool_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_mcp_server_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(anyhow!("mcp server name must not be empty"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_')
+    {
+        return Err(anyhow!(
+            "mcp server name must contain only lowercase letters, digits, dots, underscores, and hyphens"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_env_var_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(anyhow!("environment variable name must not be empty"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Err(anyhow!(
+            "environment variable name must contain only uppercase letters, digits, and underscores"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_capability_name(name: &str) -> Result<()> {
     if name.trim().is_empty() {
         return Err(anyhow!("capability name must not be empty"));
@@ -1243,6 +1406,17 @@ mod tests {
         grep_max_matches = 50
         search_max_results = 8
 
+        [mcp]
+        enabled = true
+        request_timeout_seconds = 25
+        [mcp.servers.local-files]
+        transport = "stdio"
+        command = "npx"
+        args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+        enabled = true
+        env_allowlist = ["HOME", "PATH"]
+        startup_timeout_seconds = 10
+
         [policy]
         allow_job_tasks = false
         allow_job_task_groups = ["ops"]
@@ -1296,6 +1470,14 @@ mod tests {
         assert_eq!(parsed.tool_grep_max_matches(), 50);
         assert_eq!(parsed.tool_search_max_results(), 8);
         assert!(parsed.tool_auto_router_enabled());
+        assert!(parsed.mcp_enabled());
+        assert_eq!(parsed.mcp_request_timeout_seconds(), 25);
+        assert_eq!(
+            parsed.enabled_mcp_servers(),
+            vec!["local-files".to_string()]
+        );
+        assert!(parsed.mcp_server_config("local-files").is_some());
+        assert!(parsed.mcp_server_config("missing").is_none());
     }
 
     #[test]
@@ -1499,6 +1681,10 @@ mod tests {
         assert_eq!(parsed.tool_grep_max_matches(), 100);
         assert_eq!(parsed.tool_search_max_results(), 5);
         assert!(parsed.tool_auto_router_enabled());
+        assert!(!parsed.mcp_enabled());
+        assert_eq!(parsed.mcp_request_timeout_seconds(), 20);
+        assert!(parsed.enabled_mcp_servers().is_empty());
+        assert!(parsed.mcp_server_config("anything").is_none());
         assert_eq!(
             parsed.enabled_skills(),
             vec![
@@ -1558,6 +1744,81 @@ mod tests {
 
         [plugins.signing]
         require_signatures = true
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn reject_mcp_enabled_without_servers() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [mcp]
+        enabled = true
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_mcp_transport() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [mcp]
+        enabled = true
+        [mcp.servers.files]
+        transport = "http"
+        command = "npx"
+        "#;
+
+        let parsed: AppConfig = toml::from_str(raw).unwrap();
+        assert!(parsed.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_mcp_env_allowlist_value() {
+        let raw = r#"
+        database_path = "data/assistant.db"
+        group_root = "groups"
+        runtime = "docker"
+
+        [model]
+        provider = "echo"
+        api_key_env = "OPENAI_API_KEY"
+
+        [scheduler]
+        tick_seconds = 30
+        max_concurrency = 2
+
+        [mcp]
+        enabled = true
+        [mcp.servers.files]
+        command = "npx"
+        env_allowlist = ["home"]
         "#;
 
         let parsed: AppConfig = toml::from_str(raw).unwrap();

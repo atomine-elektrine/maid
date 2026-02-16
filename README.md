@@ -70,6 +70,10 @@ maid task run-now --id <task_id>
 # plugins
 maid plugin list
 maid plugin run --name <plugin> --command help
+
+# mcp tools (requires [mcp] config)
+maid tool call --tool mcp.list_tools --arg server=<server_name>
+maid tool call --tool mcp.call --arg server=<server_name> --arg name=<tool_name> --arg arg.query=hello
 ```
 
 ## Run services
@@ -83,6 +87,9 @@ maid dashboard --port 18790
 
 # gateway
 maid gateway --port 18789
+
+# incoming MCP server (stdio)
+maid mcp serve-stdio
 
 # scheduler + gateway + telegram
 maid serve

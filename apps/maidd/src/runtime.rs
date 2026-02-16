@@ -933,6 +933,7 @@ Commands (prefix with /):\n\
 - /webhook.list\n\
 - /fs.list path=.\n\
 - /ops.search query=latest+rust+release limit=3\n\n\
+- /mcp.list_tools server=local-files\n\
 Tip: /task list maps to /task.list automatically."
 }
 
@@ -3584,6 +3585,17 @@ validate_on_startup = true
 # auto_router_enabled = true
 # auto_router_allowlist = ["ops.web_fetch", "ops.search"]
 
+# [mcp]
+# enabled = false
+# request_timeout_seconds = 20
+# [mcp.servers.local-files]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# enabled = true
+# env_allowlist = ["HOME", "PATH"]
+# startup_timeout_seconds = 10
+
 [policy]
 allow_job_tasks = false
 allow_job_task_groups = []
@@ -3635,6 +3647,17 @@ validate_on_startup = true
 [tools]
 auto_router_enabled = true
 auto_router_allowlist = ["ops.web_fetch", "ops.search", "ops.grep", "ops.code_analysis.latest", "ops.code_analysis.list", "task.list", "group.list"]
+
+# [mcp]
+# enabled = false
+# request_timeout_seconds = 20
+# [mcp.servers.local-files]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# enabled = true
+# env_allowlist = ["HOME", "PATH"]
+# startup_timeout_seconds = 10
 
 [policy]
 allow_job_tasks = false
@@ -3690,6 +3713,17 @@ quarantine_untrusted = true
 [tools]
 auto_router_enabled = true
 auto_router_allowlist = ["ops.web_fetch", "ops.search", "ops.grep", "ops.code_analysis.latest", "ops.code_analysis.list", "task.list", "group.list"]
+
+# [mcp]
+# enabled = false
+# request_timeout_seconds = 20
+# [mcp.servers.local-files]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# enabled = true
+# env_allowlist = ["HOME", "PATH"]
+# startup_timeout_seconds = 10
 
 [policy]
 allow_job_tasks = false

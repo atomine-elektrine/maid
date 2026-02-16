@@ -53,3 +53,14 @@ auto_router_allowlist = [
 auto_router_enabled = true
 web_fetch_max_bytes = 131072
 web_fetch_timeout_seconds = 15
+
+# [mcp]
+# enabled = false
+# request_timeout_seconds = 20
+# [mcp.servers.local-files]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# enabled = true
+# env_allowlist = ["HOME", "PATH"]
+# startup_timeout_seconds = 10

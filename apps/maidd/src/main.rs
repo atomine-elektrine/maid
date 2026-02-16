@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod engine;
 mod engine_tail;
+mod mcp;
 mod runtime;
 mod service;
 mod subagent;
@@ -22,7 +23,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use cli::{
-    AuditCommands, Cli, Commands, GroupCommands, PairingCommands, PluginCommands,
+    AuditCommands, Cli, Commands, GroupCommands, McpCommands, PairingCommands, PluginCommands,
     PluginLockCommands, PluginRegistryCommands, PluginRouteCommands, PluginTrustCommands,
     TaskCommands, ToolCommands,
 };
@@ -56,7 +57,7 @@ use runtime::{
     truncate_for_telegram, write_default_config,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use service::{handle_service_command, handle_tunnel_command};
 use subagent::handle_subagent_command;
 use task_commands::{handle_task_command, prompt_with_default, schedule_from_human_or_rrule};
@@ -395,6 +396,7 @@ async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .with_target(false)
+        .with_writer(io::stderr)
         .compact()
         .init();
 
@@ -544,6 +546,12 @@ async fn run() -> Result<()> {
             let service = build_service(&cfg, &cli.config, store.clone(), true)?;
             run_gateway(&cfg, store.clone(), service, port).await?;
         }
+        Commands::Mcp { command } => match command {
+            McpCommands::ServeStdio => {
+                let service = build_service(&cfg, &cli.config, store.clone(), false)?;
+                run_mcp_stdio_server(&cfg, service).await?;
+            }
+        },
     }
 
     Ok(())
@@ -594,6 +602,11 @@ async fn run_status(cfg: &AppConfig, service: Arc<AppService>, json: bool) -> Re
                 "activation_mode": cfg.telegram_activation_mode(),
             },
             "tools_auto_router_enabled": cfg.tool_auto_router_enabled(),
+            "mcp": {
+                "enabled": cfg.mcp_enabled(),
+                "servers": cfg.enabled_mcp_servers(),
+                "request_timeout_seconds": cfg.mcp_request_timeout_seconds(),
+            },
             "groups_total": groups.len(),
             "pending_pairings": pending_pairings,
             "tasks": {
@@ -636,6 +649,20 @@ async fn run_status(cfg: &AppConfig, service: Arc<AppService>, json: bool) -> Re
                 "disabled"
             }
         );
+        println!(
+            "mcp: {} (servers={}, timeout={}s)",
+            if cfg.mcp_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            if cfg.enabled_mcp_servers().is_empty() {
+                "(none)".to_string()
+            } else {
+                cfg.enabled_mcp_servers().join(", ")
+            },
+            cfg.mcp_request_timeout_seconds()
+        );
         println!("groups: {}", groups.len());
         println!("pending_pairings: {}", pending_pairings);
         println!(
@@ -658,6 +685,307 @@ async fn run_status(cfg: &AppConfig, service: Arc<AppService>, json: bool) -> Re
         );
         println!("skills: {}", cfg.enabled_skills().join(", "));
     }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct McpJsonRpcRequest {
+    jsonrpc: Option<String>,
+    id: Option<Value>,
+    method: String,
+    params: Option<Value>,
+}
+
+async fn run_mcp_stdio_server(cfg: &AppConfig, service: Arc<AppService>) -> Result<()> {
+    info!("starting mcp stdio server");
+    let mut reader = BufReader::new(tokio::io::stdin());
+    let mut writer = tokio::io::stdout();
+
+    while let Some(message) = read_mcp_stdin_message(&mut reader).await? {
+        let response = handle_mcp_json_rpc_request(cfg, service.clone(), message).await?;
+        if let Some(payload) = response {
+            write_mcp_stdout_message(&mut writer, &payload).await?;
+        }
+    }
+
+    info!("mcp stdio server stopped");
+    Ok(())
+}
+
+async fn handle_mcp_json_rpc_request(
+    cfg: &AppConfig,
+    service: Arc<AppService>,
+    message: Value,
+) -> Result<Option<Value>> {
+    let request: McpJsonRpcRequest = serde_json::from_value(message)
+        .context("invalid JSON-RPC request payload for mcp stdio server")?;
+
+    if request
+        .jsonrpc
+        .as_deref()
+        .map(|v| v != "2.0")
+        .unwrap_or(false)
+    {
+        return Ok(Some(mcp_error_response(
+            request.id,
+            -32600,
+            "invalid jsonrpc version; expected '2.0'",
+            None,
+        )));
+    }
+
+    let method = request.method.trim();
+    if method.is_empty() {
+        return Ok(Some(mcp_error_response(
+            request.id,
+            -32600,
+            "missing method",
+            None,
+        )));
+    }
+
+    if request.id.is_none() {
+        if method == "notifications/initialized" {
+            return Ok(None);
+        }
+        if method.starts_with("notifications/") {
+            return Ok(None);
+        }
+    }
+
+    let id = request.id.clone().unwrap_or(Value::Null);
+    let params = request.params.unwrap_or_else(|| json!({}));
+
+    let result = match method {
+        "initialize" => json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "tools": {},
+                "resources": {},
+                "prompts": {},
+            },
+            "serverInfo": {
+                "name": "maid",
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        }),
+        "ping" => json!({}),
+        "tools/list" => {
+            let tools = supported_tool_names()
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "name": *tool,
+                        "description": tool_summary(tool).unwrap_or(""),
+                        "inputSchema": mcp_tool_input_schema(tool),
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({ "tools": tools })
+        }
+        "tools/call" => {
+            let params_obj = params
+                .as_object()
+                .ok_or_else(|| anyhow!("mcp tools/call params must be a JSON object"))?;
+            let tool_name = params_obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| anyhow!("mcp tools/call requires params.name"))?;
+            let args = params_obj
+                .get("arguments")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let mut normalized_args = BTreeMap::new();
+            for (key, raw_value) in args {
+                if key.trim().is_empty() {
+                    continue;
+                }
+                if let Some(value) = normalize_auto_tool_arg_value(&raw_value) {
+                    normalized_args.insert(key, value);
+                }
+            }
+
+            match execute_tool_call(cfg, service, tool_name, normalized_args, "mcp").await {
+                Ok(payload) => json!({
+                    "content": [{
+                        "type": "text",
+                        "text": serde_json::to_string_pretty(&payload)?,
+                    }],
+                    "isError": false,
+                    "maidResult": payload,
+                }),
+                Err(err) => json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!("{err:#}"),
+                    }],
+                    "isError": true,
+                }),
+            }
+        }
+        "resources/list" => json!({ "resources": [] }),
+        "resources/read" => json!({ "contents": [] }),
+        "prompts/list" => json!({ "prompts": [] }),
+        _ => {
+            return Ok(Some(mcp_error_response(
+                Some(id),
+                -32601,
+                &format!("method not found: {}", method),
+                None,
+            )));
+        }
+    };
+
+    if request.id.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })))
+}
+
+fn mcp_error_response(id: Option<Value>, code: i64, message: &str, data: Option<Value>) -> Value {
+    let mut error_obj = serde_json::Map::new();
+    error_obj.insert("code".to_string(), json!(code));
+    error_obj.insert("message".to_string(), json!(message));
+    if let Some(data) = data {
+        error_obj.insert("data".to_string(), data);
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": id.unwrap_or(Value::Null),
+        "error": Value::Object(error_obj),
+    })
+}
+
+fn mcp_tool_input_schema(tool: &str) -> Value {
+    let keys: &[&str] = match tool {
+        "group.create" => &["name"],
+        "run.prompt" => &["group", "prompt"],
+        "task.list" => &["group"],
+        "task.create" => &["group", "name", "schedule", "prompt"],
+        "task.run_now" | "task.pause" | "task.resume" | "task.delete" => &["id"],
+        "task.clear_group" => &["group"],
+        "session.history" => &["group", "limit"],
+        "session.send" => &["to_group", "prompt", "from_group"],
+        "session.spawn" => &["name"],
+        "webhook.register" => &[
+            "name", "path", "group", "task_id", "prompt", "token", "enabled",
+        ],
+        "webhook.list" => &["include_disabled"],
+        "webhook.delete" => &["id", "name", "path"],
+        "fs.list" => &["group", "path", "include_hidden", "max_entries"],
+        "fs.read" => &["group", "path", "max_bytes"],
+        "fs.grep" => &["group", "pattern", "path", "ignore_case"],
+        "fs.edit" => &["group", "path", "content", "mode"],
+        "proc.start" => &["group", "command"],
+        "proc.wait" => &["id", "timeout_seconds", "remove_on_exit"],
+        "proc.kill" => &["id"],
+        "proc.logs" => &["id", "max_bytes"],
+        "ops.web_fetch" => &["url", "timeout_seconds", "max_bytes"],
+        "ops.search" => &["query", "limit", "timeout_seconds"],
+        "ops.grep" => &["group", "pattern", "path", "ignore_case"],
+        "ops.code_analysis.latest" => &[
+            "group",
+            "workflow_id",
+            "top_n",
+            "include_markdown",
+            "max_chars",
+        ],
+        "ops.code_analysis.list" => &["group", "limit"],
+        "mcp.list_tools" => &["server"],
+        "mcp.call" => &["server", "name", "arguments_json"],
+        "mcp.read_resource" => &["server", "uri"],
+        _ => &[],
+    };
+
+    let mut properties = serde_json::Map::new();
+    for key in keys {
+        properties.insert((*key).to_string(), json!({ "type": "string" }));
+    }
+    json!({
+        "type": "object",
+        "properties": Value::Object(properties),
+        "additionalProperties": true,
+    })
+}
+
+async fn read_mcp_stdin_message(reader: &mut BufReader<tokio::io::Stdin>) -> Result<Option<Value>> {
+    let mut first_line = String::new();
+    loop {
+        first_line.clear();
+        let read = reader.read_line(&mut first_line).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if !first_line.trim().is_empty() {
+            break;
+        }
+    }
+
+    let trimmed = first_line.trim_end_matches(&['\r', '\n'][..]);
+    if trimmed.starts_with('{') {
+        let parsed: Value =
+            serde_json::from_str(trimmed).context("failed to parse mcp JSON line payload")?;
+        return Ok(Some(parsed));
+    }
+
+    let (header_name, header_value) = trimmed
+        .split_once(':')
+        .ok_or_else(|| anyhow!("invalid mcp header line: {}", trimmed))?;
+    if !header_name.trim().eq_ignore_ascii_case("content-length") {
+        return Err(anyhow!(
+            "expected Content-Length header, got {}",
+            header_name
+        ));
+    }
+    let content_length = header_value
+        .trim()
+        .parse::<usize>()
+        .context("invalid Content-Length value")?;
+
+    loop {
+        let mut header = String::new();
+        let read = reader.read_line(&mut header).await?;
+        if read == 0 {
+            return Err(anyhow!("unexpected EOF while reading mcp headers"));
+        }
+        if header.trim().is_empty() {
+            break;
+        }
+    }
+
+    let mut body = vec![0_u8; content_length];
+    reader
+        .read_exact(&mut body)
+        .await
+        .context("failed to read mcp frame body")?;
+    let payload = String::from_utf8(body).context("mcp frame body is not valid utf-8")?;
+    let parsed: Value =
+        serde_json::from_str(&payload).context("failed to parse mcp JSON payload")?;
+    Ok(Some(parsed))
+}
+
+async fn write_mcp_stdout_message(writer: &mut tokio::io::Stdout, payload: &Value) -> Result<()> {
+    let body = serde_json::to_vec(payload).context("failed to encode mcp response")?;
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+    writer
+        .write_all(header.as_bytes())
+        .await
+        .context("failed to write mcp response header")?;
+    writer
+        .write_all(&body)
+        .await
+        .context("failed to write mcp response body")?;
+    writer
+        .flush()
+        .await
+        .context("failed to flush mcp response")?;
     Ok(())
 }
 
@@ -833,6 +1161,10 @@ mod tests {
             normalize_tool_name("ops.code-analysis.latest"),
             Some("ops.code_analysis.latest")
         );
+        assert_eq!(
+            normalize_tool_name("mcp.list-tools"),
+            Some("mcp.list_tools")
+        );
         assert_eq!(normalize_tool_name("unknown.tool"), None);
     }
 
@@ -842,5 +1174,7 @@ mod tests {
         assert!(rendered.contains("task.run_now"));
         assert!(rendered.contains("task.run-now"));
         assert_eq!(render_tool_name_with_aliases("group.list"), "group.list");
+        let mcp_rendered = render_tool_name_with_aliases("mcp.list_tools");
+        assert!(mcp_rendered.contains("mcp.list-tools"));
     }
 }

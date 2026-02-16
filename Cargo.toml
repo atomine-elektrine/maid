@@ -29,7 +29,7 @@ serde_json = "1.0"
 shell-words = "1.1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
 thiserror = "2.0"
-tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "signal", "time", "process", "fs", "sync", "net", "io-util"] }
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "signal", "time", "process", "fs", "sync", "net", "io-util", "io-std"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

@@ -1,4 +1,7 @@
 use super::*;
+use crate::mcp::{
+    execute_mcp_call_tool, execute_mcp_list_tools_tool, execute_mcp_read_resource_tool,
+};
 
 pub(crate) async fn handle_audit_command(
     service: Arc<AppService>,
@@ -275,6 +278,9 @@ pub(crate) async fn execute_tool_call(
             execute_code_analysis_latest_tool(cfg, service, tool, args).await
         }
         "ops.code_analysis.list" => execute_code_analysis_list_tool(service, tool, args).await,
+        "mcp.list_tools" => execute_mcp_list_tools_tool(cfg, tool, args).await,
+        "mcp.call" => execute_mcp_call_tool(cfg, tool, args).await,
+        "mcp.read_resource" => execute_mcp_read_resource_tool(cfg, tool, args).await,
         _ => Err(anyhow!("unsupported tool '{}'", tool)),
     }
 }
@@ -2731,6 +2737,9 @@ pub(crate) fn format_tool_call_args(tool: &str, args: &BTreeMap<String, String>)
         "webhook.delete" => &["id", "name", "path"],
         "ops.code_analysis.latest" => &["group", "workflow_id", "top_n", "include_markdown"],
         "ops.code_analysis.list" => &["group", "limit"],
+        "mcp.list_tools" => &["server"],
+        "mcp.call" => &["server", "name", "arguments_json"],
+        "mcp.read_resource" => &["server", "uri"],
         "task.list" => &["group"],
         "task.create" => &["group", "name", "schedule"],
         "task.run_now" => &["id"],
@@ -2835,6 +2844,20 @@ pub(crate) fn summarize_tool_payload(tool: &str, payload: &serde_json::Value) ->
             .get("workflows")
             .and_then(|v| v.as_array())
             .map(|items| format!("workflows={}", items.len())),
+        "mcp.list_tools" => payload
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|items| format!("tools={}", items.len())),
+        "mcp.call" => payload
+            .get("response")
+            .and_then(|v| v.get("content"))
+            .and_then(|v| v.as_array())
+            .map(|items| format!("content={}", items.len())),
+        "mcp.read_resource" => payload
+            .get("response")
+            .and_then(|v| v.get("contents"))
+            .and_then(|v| v.as_array())
+            .map(|items| format!("contents={}", items.len())),
         "task.list" => payload
             .get("tasks")
             .and_then(|v| v.as_array())
@@ -3476,6 +3499,9 @@ pub(crate) fn supported_tool_names() -> &'static [&'static str] {
         "ops.grep",
         "ops.code_analysis.latest",
         "ops.code_analysis.list",
+        "mcp.list_tools",
+        "mcp.call",
+        "mcp.read_resource",
     ]
 }
 
@@ -3499,6 +3525,8 @@ pub(crate) fn tool_aliases(name: &str) -> &'static [&'static str] {
         "ops.web_fetch" => &["ops.web-fetch"],
         "ops.code_analysis.latest" => &["ops.code-analysis.latest"],
         "ops.code_analysis.list" => &["ops.code-analysis.list"],
+        "mcp.list_tools" => &["mcp.list-tools"],
+        "mcp.read_resource" => &["mcp.read-resource"],
         _ => &[],
     }
 }
@@ -3551,6 +3579,11 @@ pub(crate) fn tool_summary(name: &str) -> Option<&'static str> {
             "Get latest code-analysis workflow + top findings; args: group,[workflow_id],[top_n],[include_markdown],[max_chars]",
         ),
         "ops.code_analysis.list" => Some("List recent code-analysis workflows; args: group,[limit]"),
+        "mcp.list_tools" => Some("List tools exposed by an MCP server; args: server"),
+        "mcp.call" => Some(
+            "Call an MCP tool; args: server,name,[arguments_json],[arg.<key>=value...]",
+        ),
+        "mcp.read_resource" => Some("Read MCP resource; args: server,uri"),
         _ => None,
     }
 }

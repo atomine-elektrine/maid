@@ -113,6 +113,10 @@ pub(crate) enum Commands {
         #[arg(long, default_value_t = 18789)]
         port: u16,
     },
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -536,4 +540,10 @@ pub(crate) enum TunnelCommands {
         #[arg(long)]
         ssh_host: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum McpCommands {
+    #[command(visible_alias = "serve")]
+    ServeStdio,
 }
